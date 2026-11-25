@@ -1666,6 +1666,7 @@ namespace ABBridgesRevit
                 if (e.KeyCode == Keys.Up && _list.Items.Count > 0) { _list.SelectedIndex = Math.Max(0, _list.SelectedIndex - 1); e.Handled = true; }
             };
             Fill(string.IsNullOrEmpty(current) ? None : current);
+            Brand.AddHeader(this, "Choose " + what);
             Shown += (s, e) => _search.Focus();
         }
 

@@ -52,6 +52,24 @@ namespace ABBridgesRevit
             catch { return null; }
         }
 
+        // the AB Bridges header on any dialog: everything moves down by the header height, the window grows by it
+        public static void AddHeader(Form f, string page)
+        {
+            int h = BrandHeader.Height0;
+            f.SuspendLayout();
+            foreach (Control c in f.Controls.Cast<Control>().ToList())
+            {
+                if (c.Dock != DockStyle.None) continue;
+                bool t = (c.Anchor & AnchorStyles.Top) != 0, b = (c.Anchor & AnchorStyles.Bottom) != 0;
+                if (t || !b) c.Top += h;
+            }
+            f.ClientSize = new Size(f.ClientSize.Width, f.ClientSize.Height + h);
+            if (f.MinimumSize.Height > 0) f.MinimumSize = new Size(f.MinimumSize.Width, f.MinimumSize.Height + h);
+            f.Controls.Add(new BrandHeader(page));
+            SetIcon(f);
+            f.ResumeLayout();
+        }
+
         // window icon (embedded AB.ico)
         public static void SetIcon(Form f)
         {

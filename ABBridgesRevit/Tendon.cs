@@ -375,8 +375,11 @@ namespace ABBridgesRevit
         public double VScale = 3;
         public bool Make3D = true;
         public int Stages, Paths;
+        public const string NoFamily = "(no family - lines + text)";
+        public string TableFamily = NoFamily;          // "Family : Type" or NoFamily
+        public string TableFile;                       // a .rfa chosen with Load...
 
-        public TendonForm(TendonSet set, TendonGeo g, List<string> titleBlocks, bool update)
+        public TendonForm(TendonSet set, TendonGeo g, List<string> titleBlocks, bool update, List<string> details = null, string lastTable = null)
         {
             Text = update ? "AB Bridges - Update Tendon" : "AB Bridges - Create Tendon";
             Font = new System.Drawing.Font("Segoe UI", 9f);
@@ -384,9 +387,7 @@ namespace ABBridgesRevit
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(520, 470);
             BackColor = WinColor.White;
-            Controls.Add(new Label { Text = "  " + Text.Replace("AB Bridges - ", "AB Bridges  ·  "), Dock = DockStyle.Top, Height = 34, BackColor = UiTheme.Navy, ForeColor = WinColor.White,
-                                     Font = new System.Drawing.Font("Segoe UI Semibold", 11f), TextAlign = ContentAlignment.MiddleLeft });
-            var list = new ListView { Location = new Point(14, 48), Size = new Size(492, 200), View = System.Windows.Forms.View.Details, FullRowSelect = true, HeaderStyle = ColumnHeaderStyle.Nonclickable };
+            var list = new ListView { Location = new Point(14, 14), Size = new Size(492, 200), View = System.Windows.Forms.View.Details, FullRowSelect = true, HeaderStyle = ColumnHeaderStyle.Nonclickable };
             list.Columns.Add("Profile", 130); list.Columns.Add("Points", 70); list.Columns.Add("Split after this stage", 270);
             foreach (TendonProfile p in set.Profiles.OrderBy(x => x.Path).ThenBy(x => x.Stage))
             {
@@ -399,17 +400,16 @@ namespace ABBridgesRevit
                 list.Items.Add(it);
             }
             Controls.Add(list);
-            Controls.Add(new Label { Text = "Stages = the splits typed in the Excel under every path (Split at). Change them there, then Update Tendon.",
-                                     Location = new Point(14, 252), Size = new Size(492, 32), ForeColor = WinColor.DimGray });
-
-            int y = 292;
-            Controls.Add(new Label { Text = "Stages", Location = new Point(14, y + 3), AutoSize = true });
-            var nS = new NumericUpDown { Location = new Point(110, y), Width = 60, Minimum = 1, Maximum = 9, Value = Math.Max(1, set.Stages), Enabled = false };
-            Controls.Add(nS);
-            Controls.Add(new Label { Text = "Paths", Location = new Point(200, y + 3), AutoSize = true });
-            var nP = new NumericUpDown { Location = new Point(250, y), Width = 60, Minimum = 1, Maximum = 4, Value = Math.Max(1, set.Whole.Count) };
-            Controls.Add(nP);
-            y += 34;
+            // stages and paths come from the Excel only (Paths = B2, Stages = the splits): shown, not edited here
+            int y = 224;
+            var ro = new Label
+            {
+                Text = $"Stages: {Math.Max(1, set.Stages)}   ·   Paths: {Math.Max(1, set.Whole.Count)}      (from the Excel: Paths = B2, Stages = the splits)",
+                Location = new Point(14, y), Size = new Size(492, 28), BackColor = WinColor.FromArgb(244, 246, 249), ForeColor = UiTheme.Navy,
+                TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(8, 0, 0, 0), BorderStyle = BorderStyle.FixedSingle
+            };
+            Controls.Add(ro);
+            y += 42;
             Controls.Add(new Label { Text = "Vertical scale", Location = new Point(14, y + 3), AutoSize = true });
             var vs = new NumericUpDown { Location = new Point(110, y), Width = 60, Minimum = 1, Maximum = 10, DecimalPlaces = 1, Value = 3 };
             Controls.Add(vs);
@@ -421,17 +421,47 @@ namespace ABBridgesRevit
             tb.Items.AddRange(titleBlocks.Cast<object>().ToArray());
             if (tb.Items.Count > 0) tb.SelectedIndex = 0;
             Controls.Add(tb);
+            y += 34;
+            // the 2D family of the distance table (default AB Tendon Table Column; any detail item with the same parameters)
+            Controls.Add(new Label { Text = "Table family", Location = new Point(14, y + 3), AutoSize = true });
+            var tf = new ComboBox { Location = new Point(110, y), Width = 300, DropDownStyle = ComboBoxStyle.DropDownList };
+            const string Def = TendonDraw.TableFamilyName + " (from the add-in folder)";
+            var names = (details ?? new List<string>()).ToList();
+            if (!names.Any(n => n.StartsWith(TendonDraw.TableFamilyName + " : "))) names.Insert(0, Def);
+            tf.Items.AddRange(names.Cast<object>().ToArray());
+            tf.Items.Add(NoFamily);
+            int sel = lastTable != null ? tf.Items.IndexOf(lastTable) : -1;
+            if (sel < 0) sel = Enumerable.Range(0, tf.Items.Count).FirstOrDefault(i => ((string)tf.Items[i]).StartsWith(TendonDraw.TableFamilyName));
+            tf.SelectedIndex = Math.Max(0, sel);
+            Controls.Add(tf);
+            var load = new Button { Text = "Load...", Location = new Point(416, y - 1), Size = new Size(90, 26) };
+            load.Click += (s, e) =>
+            {
+                using (var d = new OpenFileDialog { Title = "Choose the table family", Filter = "Revit family (*.rfa)|*.rfa" })
+                    if (d.ShowDialog(this) == DialogResult.OK)
+                    {
+                        TableFile = d.FileName;
+                        string n = Path.GetFileNameWithoutExtension(d.FileName) + " (file)";
+                        if (!tf.Items.Contains(n)) tf.Items.Insert(0, n);
+                        tf.SelectedItem = n;
+                    }
+            };
+            Controls.Add(load);
 
             var ok = new Button { Text = update ? "Update" : "Create", Location = new Point(316, 420), Size = new Size(92, 32), BackColor = UiTheme.Navy, ForeColor = WinColor.White, FlatStyle = FlatStyle.Flat };
             var cancel = new Button { Text = "Cancel", Location = new Point(414, 420), Size = new Size(92, 32), DialogResult = DialogResult.Cancel };
             ok.Click += (s, e) =>
             {
                 TitleBlock = tb.SelectedItem as string; VScale = (double)vs.Value; Make3D = c3.Checked;
-                Stages = (int)nS.Value; Paths = (int)nP.Value;
+                Stages = Math.Max(1, set.Stages); Paths = Math.Max(1, set.Whole.Count);
+                string pick = tf.SelectedItem as string ?? NoFamily;
+                if (!pick.EndsWith(" (file)")) TableFile = null;
+                TableFamily = pick == Def ? TendonDraw.TableFamilyName : pick;
                 DialogResult = DialogResult.OK; Close();
             };
             Controls.Add(ok); Controls.Add(cancel);
             CancelButton = cancel;
+            Brand.AddHeader(this, update ? "Update Tendon" : "Create Tendon");
             Shown += (s, e) => UiTheme.Snap(this, "Revit " + Text.Replace("AB Bridges - ", ""));
         }
     }
@@ -451,7 +481,7 @@ namespace ABBridgesRevit
 
     internal static class TendonRun
     {
-        private const string ExcelKey = "SUB|EXCEL", IdsKey = "TEN|IDS|", SheetKey = "TEN|SHEET|", ViewKey = "TEN|VIEW|";
+        private const string ExcelKey = "SUB|EXCEL", IdsKey = "TEN|IDS|", SheetKey = "TEN|SHEET|", ViewKey = "TEN|VIEW|", TableKey = "TEN|TABLEFAM";
         private static readonly CultureInfo CI = CultureInfo.InvariantCulture;
         private static double Ft(double m) => UnitUtils.ConvertToInternalUnits(m, UnitTypeId.Meters);
 
@@ -483,9 +513,12 @@ namespace ABBridgesRevit
 
                 List<string> tbs = new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_TitleBlocks).OfClass(typeof(FamilySymbol))
                     .Cast<FamilySymbol>().Select(s => s.FamilyName + " : " + s.Name).OrderBy(n => n).ToList();
+                List<string> details = new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_DetailComponents).OfClass(typeof(FamilySymbol))
+                    .Cast<FamilySymbol>().Select(s => s.FamilyName + " : " + s.Name).OrderBy(n => n).ToList();
                 TendonForm form;
-                using (form = new TendonForm(set, g, tbs, update))
+                using (form = new TendonForm(set, g, tbs, update, details, map.TryGetValue(TableKey, out string lastT) ? lastT : null))
                     if (form.ShowDialog() != DialogResult.OK) return UI.Result.Cancelled;
+                map[TableKey] = form.TableFamily;
 
                 // more / fewer stages or paths: the sheet is written again (values kept) - the user fills the new blocks first
                 bool missing = set.Whole.Any(w => set.Splits.TryGetValue(w.Path, out string sp0) &&
@@ -503,12 +536,6 @@ namespace ABBridgesRevit
                 if (noY.Count > 0)
                 {
                     UI.TaskDialog.Show("AB Bridges", "Type the Y of the split point in Path " + string.Join(", ", noY) + ", save the Excel, then run it again.");
-                    return UI.Result.Succeeded;
-                }
-                if (form.Paths != set.Whole.Count)
-                {
-                    TendonSheet.Write(excel, form.Paths, g.Spans, set);
-                    UI.TaskDialog.Show("AB Bridges", $"The Excel now has {form.Paths} path(s) (your values kept). Fill the new ones, save, then run it again.");
                     return UI.Result.Succeeded;
                 }
 
@@ -551,7 +578,7 @@ namespace ABBridgesRevit
                         .Cast<FamilySymbol>().FirstOrDefault(x => x.FamilyName + " : " + x.Name == form.TitleBlock);
                     ViewFamilyType vft = new FilteredElementCollector(doc).OfClass(typeof(ViewFamilyType)).Cast<ViewFamilyType>().FirstOrDefault(x => x.ViewFamily == ViewFamily.Drafting);
                     if (vft == null) log.AppendLine("No drafting view type in the project.");
-                    FamilySymbol col = TendonDraw.TableFamily(doc, log);
+                    FamilySymbol col = TendonDraw.TableFamily(doc, log, form.TableFamily, form.TableFile);
                     int nSheets = 0;
                     for (int stage = 1; stage <= set.Stages && vft != null; stage++)
                     {
@@ -908,6 +935,7 @@ namespace ABBridgesRevit
                     {
                         FamilyInstance fi = doc.Create.NewFamilyInstance(new XYZ(x0 + k * cw, y0, 0), col, v);
                         SetText(fi, "X Label", labs[k]); SetText(fi, "Y Value", vals[k]); SetLen(fi, "Width", cw);
+                        SetLen(fi, "Row 1 H", rh1); SetLen(fi, "Row 2 H", rh2);          // when they are instance parameters
                         ids.Add(fi.Id);
                     }
                     Ln(new XYZ(x0 + n * cw, y0, 0), new XYZ(x0 + n * cw, y0 - rh1 - rh2, 0), thin);
@@ -988,18 +1016,57 @@ namespace ABBridgesRevit
         }
 
         // the 2D table column family (Families\AB Tendon Table Column.rfa next to the add-in); null = draw with lines + text
-        public static FamilySymbol TableFamily(Document doc, StringBuilder log)
+        public const string TableFamilyName = "AB Tendon Table Column";
+        private static readonly string[] TableParams = { "X Label", "Y Value", "Width", "Row 1 H", "Row 2 H" };
+
+        // pick = "Family : Type" from the list, the default name, or "(no family ...)"; file = a .rfa chosen with Load...
+        public static FamilySymbol TableFamily(Document doc, StringBuilder log, string pick = TableFamilyName, string file = null)
         {
-            const string Name = "AB Tendon Table Column";
-            Family f = new FilteredElementCollector(doc).OfClass(typeof(Family)).Cast<Family>().FirstOrDefault(x => x.Name == Name);
-            if (f == null)
+            if (string.IsNullOrEmpty(pick) || pick == TendonForm.NoFamily) return null;
+            FamilySymbol sym = null;
+            try
             {
-                string dir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? "";
-                string file = new[] { Path.Combine(dir, "Families", Name + ".rfa"), Path.Combine(dir, Name + ".rfa") }.FirstOrDefault(File.Exists);
-                if (file == null) return null;
-                try { doc.LoadFamily(file, out f); } catch (Exception e) { log.AppendLine("Table family not loaded: " + e.Message); return null; }
+                Family f = null;
+                if (file != null && File.Exists(file))
+                {
+                    doc.LoadFamily(file, out f);
+                    if (f == null)      // already in the project under the file's name
+                        f = new FilteredElementCollector(doc).OfClass(typeof(Family)).Cast<Family>().FirstOrDefault(x => x.Name == Path.GetFileNameWithoutExtension(file));
+                }
+                if (f == null && pick.Contains(" : "))
+                    sym = new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_DetailComponents).OfClass(typeof(FamilySymbol)).Cast<FamilySymbol>()
+                        .FirstOrDefault(x => x.FamilyName + " : " + x.Name == pick);
+                if (sym == null && f == null)
+                {
+                    f = new FilteredElementCollector(doc).OfClass(typeof(Family)).Cast<Family>().FirstOrDefault(x => x.Name == TableFamilyName);
+                    if (f == null)
+                    {
+                        string dir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? "";
+                        string def = new[] { Path.Combine(dir, "Families", TableFamilyName + ".rfa"), Path.Combine(dir, TableFamilyName + ".rfa") }.FirstOrDefault(File.Exists);
+                        if (def == null) { log.AppendLine($"Table family \"{TableFamilyName}.rfa\" not found next to the add-in - table drawn with lines + text."); return null; }
+                        doc.LoadFamily(def, out f);
+                    }
+                }
+                if (sym == null && f != null) sym = f.GetFamilySymbolIds().Select(id => doc.GetElement(id) as FamilySymbol).FirstOrDefault(x => x != null);
             }
-            return f == null ? null : f.GetFamilySymbolIds().Select(id => doc.GetElement(id) as FamilySymbol).FirstOrDefault(x => x != null);
+            catch (Exception e) { log.AppendLine("Table family not loaded: " + e.Message); return null; }
+            if (sym == null) return null;
+            // the parameters the table needs (type or instance); missing -> lines + text
+            if (!sym.IsActive) sym.Activate();
+            var missing = TableParams.Where(n => sym.LookupParameter(n) == null && !HasInstanceParam(sym.Family, n)).ToList();
+            if (missing.Count > 0) { log.AppendLine($"Table family \"{sym.FamilyName}\" has no parameter(s) {string.Join(", ", missing)} - table drawn with lines + text."); return null; }
+            return sym;
+        }
+
+        private static bool HasInstanceParam(Family f, string name)
+        {
+            try
+            {
+                Document fd = f.Document.EditFamily(f);
+                try { return fd.FamilyManager.Parameters.Cast<FamilyParameter>().Any(p => p.Definition.Name == name); }
+                finally { fd.Close(false); }
+            }
+            catch { return true; }      // cannot check: try it
         }
 
         // text type "AB Tendon 2 mm": known size, so the table cells can be sized to the text

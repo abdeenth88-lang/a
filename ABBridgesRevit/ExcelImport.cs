@@ -382,6 +382,7 @@ namespace ABBridgesRevit
                 var ok = new Button { Text = "Done", Location = new Point(150, 52), Size = new Size(80, 28), DialogResult = DialogResult.OK, BackColor = WinColor.FromArgb(232, 121, 43), ForeColor = WinColor.White, FlatStyle = FlatStyle.Flat };
                 var no = new Button { Text = "Cancel", Location = new Point(238, 52), Size = new Size(80, 28), DialogResult = DialogResult.Cancel };
                 Controls.Add(ok); Controls.Add(no); AcceptButton = ok; CancelButton = no;
+                Brand.SetIcon(this);
             }
         }
 
@@ -396,8 +397,7 @@ namespace ABBridgesRevit
             {
                 Text = "AB Bridges - Import Excel"; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = MinimizeBox = false;
                 StartPosition = FormStartPosition.CenterScreen; ClientSize = new Size(520, 330); Font = new Font("Segoe UI", 9f);
-                var head = new Label { Text = "Import Excel", Dock = DockStyle.Top, Height = 34, BackColor = WinColor.FromArgb(31, 58, 95), ForeColor = WinColor.White, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(10, 0, 0, 0), Font = new Font("Segoe UI", 10f, FontStyle.Bold) };
-                var grid = new DataGridView { Location = new Point(10, 44), Size = new Size(500, 170), AllowUserToAddRows = false, AllowUserToDeleteRows = false, RowHeadersVisible = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, BackgroundColor = WinColor.White };
+                var grid = new DataGridView { Location = new Point(10, 10), Size = new Size(500, 170), AllowUserToAddRows = false, AllowUserToDeleteRows = false, RowHeadersVisible = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, BackgroundColor = WinColor.White };
                 grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Range", ReadOnly = true, FillWeight = 35 });
                 grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Table name (drafting view)", FillWeight = 65 });
                 foreach (XlTable t in tables) grid.Rows.Add(t.Sheet + "!" + t.Address, t.Sheet + " " + t.Address);
@@ -420,8 +420,12 @@ namespace ABBridgesRevit
                     }
                     DialogResult = DialogResult.OK;
                 };
-                Controls.AddRange(new System.Windows.Forms.Control[] { grid, _sheet, _size, ok, no, head });
+                foreach (var c in new System.Windows.Forms.Control[] { _sheet, _size, ok, no }) c.Top -= 34;
+                foreach (var c in Controls.Cast<System.Windows.Forms.Control>()) if (c is Label) c.Top -= 34;
+                ClientSize = new Size(ClientSize.Width, ClientSize.Height - 34);
+                Controls.AddRange(new System.Windows.Forms.Control[] { grid, _sheet, _size, ok, no });
                 AcceptButton = ok; CancelButton = no;
+                Brand.AddHeader(this, "Import Excel");
             }
         }
     }
