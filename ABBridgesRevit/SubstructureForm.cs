@@ -1,8 +1,8 @@
 // AB Bridges for Revit - Substructure dialog.
-// Left: the Excel, one tab per axis, the families of the axis (bearing row first, then the families in order:
-// surface + vertical offset + offset from the alignment), the bearing settings and the family parameters.
-// Right: the section at the axis (design surface, NGL, the deck cut at the axis, the families and the bearings);
-// a family or a bearing can be dragged (5 cm steps).
+// Top: the Excel and the longitudinal view of the bridge. Under it one small card per axis, under its bubble: the real
+// Revit section at the axis (live) and the families of the axis; click a card to edit that axis, double-click to open the
+// section big (Measure, Fit, Depth, Crop, Plan). Bottom strip: left the families of the axis (bearing row first, then the
+// families in order: surface + vertical offset + offset from the alignment), right the bearing settings and the parameters.
 // No Revit types here: the command gives the families, their parameters, their sizes and the deck sections.
 
 using System;
@@ -44,7 +44,10 @@ namespace ABBridgesRevit
         private CheckBox _measure;
         private Label _measureText;
         private Label _copyLbl, _viewNote;
-        private Button _copyBtn, _addBtn, _upBtn, _downBtn, _removeBtn;
+        private Button _copyBtn, _addBtn, _upBtn, _downBtn, _removeBtn, _loadBtn, _browse, _see, _createBtn, _saveBtn, _closeBtn;
+        private Label _xlLbl;
+        private Panel _line;
+        public Func<string[], List<string>> LoadFamilies;       // loads .rfa files into the project, returns the family types now
         private readonly Dictionary<string, SubSection> _sections = new Dictionary<string, SubSection>(StringComparer.OrdinalIgnoreCase);
 
         public BridgeExcel Excel { get; private set; }
@@ -132,16 +135,18 @@ namespace ABBridgesRevit
             FormBorderStyle = FormBorderStyle.Sizable;
             MaximizeBox = true;
             MinimizeBox = false;
-            MinimumSize = new Size(1100, 700);
+            MinimumSize = new Size(1100, 860);
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(1240, 748);
+            ClientSize = new Size(1240, 1000);
             BackColor = Color.White;
 
             // ---- Excel
-            Controls.Add(new Label { Text = "Excel file", Location = new Point(12, 15), AutoSize = true });
+            _xlLbl = new Label { Text = "Excel file", Location = new Point(12, 15), AutoSize = true };
+            Controls.Add(_xlLbl);
             _tb = new TextBox { Location = new Point(80, 11), Size = new Size(520, 25), Text = excelPath ?? "" };
             Controls.Add(_tb);
             Button browse = Flat("Browse...", new Point(608, 9), 90, false);
+            _browse = browse;
             browse.Click += (s, e) =>
             {
                 using (var dlg = new OpenFileDialog { Title = "Choose the bridge Excel (from AB Bridges in Civil 3D)", Filter = "Excel (*.xlsx)|*.xlsx" })
@@ -238,6 +243,11 @@ namespace ABBridgesRevit
                 Changed();
             };
             Controls.AddRange(new Control[] { add, up, down, remove });
+            // load .rfa files into the project without opening them; the new types show in every family list at once
+            _loadBtn = Flat("Load family...", new Point(304, 304), 120, true);
+            _loadBtn.BackColor = Orange; _loadBtn.FlatAppearance.BorderColor = Orange;
+            _loadBtn.Click += (s, e) => LoadFamilyFiles();
+            Controls.Add(_loadBtn);
             // the plan where lines are picked
             _pickLbl = new Label { Text = "⌖ pick in", Location = new Point(312, 311), AutoSize = true, ForeColor = Grey };
             _pickView = new ComboBox { Location = new Point(376, 306), Size = new Size(142, 25), DropDownStyle = ComboBoxStyle.DropDownList };
@@ -433,6 +443,7 @@ namespace ABBridgesRevit
                 StopMeasure();
             };
             Button see = Flat("Show in Revit", new Point(1098, 648), 130, true);
+            _see = see;
             see.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             see.Click += (s, e) =>
             {
@@ -447,6 +458,7 @@ namespace ABBridgesRevit
 
             // ---- bottom
             var line = new Panel { Location = new Point(0, 690), Size = new Size(1240, 1), BackColor = Color.FromArgb(220, 224, 230), Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right };
+            _line = line;
             Controls.Add(line);
             _prev = Flat("←", new Point(12, 704), 80, false);
             _prev.Click += (s, e) => { if (_tabs.SelectedIndex > 0) _tabs.SelectedIndex--; };
@@ -465,25 +477,24 @@ namespace ABBridgesRevit
             close.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
             create.Anchor = save.Anchor = close.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             Controls.AddRange(new Control[] { create, save, close });
+            _createBtn = create; _saveBtn = save; _closeBtn = close;
             Resize += (s, e) => { Relayout(); LayoutParams(); };
-            // ---- longitudinal view on top (everything else moves down)
-            // ---- AB Bridges header (logo) on top of everything
-            const int LongH = 240, HeadH = BrandHeader.Height0;
-            int shift = LongH + HeadH;
-            _top = shift;
-            ClientSize = new Size(ClientSize.Width, ClientSize.Height + shift);   // bottom-anchored controls follow by themselves
-            foreach (Control c in Controls.Cast<Control>().ToList())
-            {
-                bool t = (c.Anchor & AnchorStyles.Top) != 0, b = (c.Anchor & AnchorStyles.Bottom) != 0;
-                if (t && b) { c.Top += shift; c.Height -= shift; }
-                else if (t || !b) c.Top += shift;
-            }
-            MinimumSize = new Size(MinimumSize.Width, MinimumSize.Height + shift);
+            // ---- header, longitudinal view, the axis cards; the big section lives in its own window (double-click a card)
+            foreach (Control c in Controls.Cast<Control>().ToList()) c.Anchor = AnchorStyles.Top | AnchorStyles.Left;   // all placed by LayoutAll
             Controls.Add(new BrandHeader("Substructure"));
             Brand.SetIcon(this);
-            _long = new LongView { Location = new Point(12, HeadH + 6), Size = new Size(ClientSize.Width - 24, LongH - 12), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            _long = new LongView();
             _long.AxisClicked += n => { if (Excel == null) return; int k = Excel.Axes.FindIndex(x => x.Name == n); if (k >= 0) _tabs.SelectedIndex = k; };
             Controls.Add(_long);
+            _cardsPanel = new Panel { BackColor = Color.White };
+            Controls.Add(_cardsPanel);
+            Controls.Remove(_view);
+            _view.Dock = DockStyle.Fill;
+            _view.BorderStyle = BorderStyle.None;
+            _tabs.Visible = false;                    // the cards / bubbles choose the axis; the tabs only keep the selection
+            _viewNote.Visible = false;
+            _tabs.SelectedIndexChanged += (s2, e2) => MarkCards();
+            FormClosing += (s2, e2) => { try { _big?.Close(); } catch { } DropCards(); };
             UiTheme.StyleTabs(_tabs);
             _tabs.SelectedIndexChanged += (s2, e2) => SnapLater();
 
@@ -550,6 +561,7 @@ namespace ABBridgesRevit
         {
             string p = _tb.Text.Trim();
             Excel = null;
+            DropCards();
             _tabs.TabPages.Clear();
             _sections.Clear();
             if (!File.Exists(p)) { _status.ForeColor = Red; _status.Text = "The file is not found."; ShowAxis(); return; }
@@ -578,6 +590,8 @@ namespace ABBridgesRevit
             _status.ForeColor = Green;
             _status.Text = $"✓ {Excel.BridgeName} · {Excel.Axes.Count} axes · sheet Substructure found";
             UpdateTabs();
+            RefreshLong();
+            BuildCards();
             int start = string.IsNullOrEmpty(StartAxis) ? 0 : Math.Max(0, Excel.Axes.FindIndex(x => string.Equals(x.Name, StartAxis, StringComparison.OrdinalIgnoreCase)));
             _tabs.SelectedIndex = start;
             ShowAxis();
@@ -605,6 +619,7 @@ namespace ABBridgesRevit
                 }
             }
             _summary.Text = string.Join(" · ", parts);
+            RefreshCards();
         }
 
         private void ShowAxis()
@@ -645,7 +660,7 @@ namespace ABBridgesRevit
 
         private void ShowPreview(bool force)
         {
-            if (_previewOf == null) return;
+            if (_previewOf == null || _big == null) return;     // the cards show the sections; the big one only in its window
             AxisData a = CurAxis;
             if (a == null) { DropPreview(); _secHead.Text = ""; return; }
             if (!force && _preview != null && _previewAxis == a.Name + "|" + _mode) return;
@@ -1015,47 +1030,242 @@ namespace ABBridgesRevit
         // the left side takes about 40 % of the width (at least 506 px), the section the rest
         private int LeftW => Math.Max(506, (int)(ClientSize.Width * 0.40) - 12);
 
-        private int _top;          // height of the header + longitudinal view above the absolute layout
+        private void Relayout() => LayoutAll();
+        private void LayoutParams() => LayoutAll();
 
-        private void Relayout()
+        // everything placed from the window size: Excel row, long view, the cards, the bottom strip, the bottom bar
+        private void LayoutAll()
         {
-            if (_grid == null || _view == null) return;
-            int w = LeftW;
-            _tabs.Width = w;
-            _famHead.Width = w;
-            _detHead.Width = w;
-            _grid.Width = w;
-            _bear.Width = w;
-            // Copy from: right-aligned on the left side, after its label
-            _copyBtn.Left = 12 + w - _copyBtn.Width;
-            _copyFrom.Left = _copyBtn.Left - 8 - _copyFrom.Width;
-            _copyLbl.Left = _copyFrom.Left - 6 - _copyLbl.PreferredWidth;
-            _copyLbl.Top = _copyFrom.Top + (_copyFrom.Height - _copyLbl.PreferredHeight) / 2;
-            _pickView.Left = 12 + w - _pickView.Width;
-            _pickLbl.Left = _pickView.Left - 6 - _pickLbl.PreferredWidth;
-            // grid columns: the family column takes the extra width
+            if (_grid == null || _params == null || _long == null || _cardsPanel == null) return;
+            int W = ClientSize.Width, H = ClientSize.Height, m = 12;
+            int y = BrandHeader.Height0 + 8;
+            _xlLbl.Location = new Point(m, y + 4);
+            _tb.SetBounds(80, y, Math.Min(520, W / 2 - 100), 25);
+            _browse.Location = new Point(_tb.Right + 8, y - 2);
+            _status.SetBounds(_browse.Right + 12, y + 3, Math.Max(100, W - _browse.Right - 24), 20);
+            y += 34;
+
+            const int bar = 52;
+            int strip = Math.Max(250, (int)((H - y - bar) * 0.36));
+            int avail = Math.Max(300, H - y - bar - strip - 12);
+            int longH = Math.Max(130, (int)(avail * 0.42));
+            int cardsH = avail - longH - 6;
+            _long.SetBounds(m, y, W - 2 * m, longH);
+            y += longH + 6;
+            _cardsPanel.SetBounds(m, y, W - 2 * m, cardsH);
+            LayoutCards();
+            y += cardsH + 12;
+
+            // bottom strip: left the families of the axis, right the bearing settings + the parameters
+            int lw = (int)((W - 3 * m) * 0.52), rx = 2 * m + lw, rw = W - rx - m;
+            int top = y, bottom = H - bar - 8;
+            _famHead.SetBounds(m, top + 2, Math.Max(120, lw - 420), 18);
+            _copyBtn.Location = new Point(m + lw - _copyBtn.Width, top - 2);
+            _copyFrom.Location = new Point(_copyBtn.Left - 8 - _copyFrom.Width, top + 1);
+            _copyLbl.Location = new Point(_copyFrom.Left - 6 - _copyLbl.PreferredWidth, top + 4);
+            _create.Location = new Point(_copyLbl.Left - 18 - _create.PreferredSize.Width, top + 2);
+            int by = bottom - 30;
+            _grid.SetBounds(m, top + 26, lw, Math.Max(80, by - top - 32));
+            _addBtn.Location = new Point(m, by); _upBtn.Location = new Point(_addBtn.Right + 6, by); _downBtn.Location = new Point(_upBtn.Right + 4, by);
+            _removeBtn.Location = new Point(_downBtn.Right + 6, by); _loadBtn.Location = new Point(_removeBtn.Right + 8, by);
+            _pickView.Location = new Point(m + lw - _pickView.Width, by + 2);
+            _pickLbl.Location = new Point(_pickView.Left - 6 - _pickLbl.PreferredWidth, by + 7);
             int fixedCols = _grid.Columns["No"].Width + _grid.Columns["Pick"].Width + _grid.Columns["Surf"].Width + _grid.Columns["V"].Width + _grid.Columns["H"].Width + _grid.Columns["PickH"].Width + 4;
-            _grid.Columns["Fam"].Width = Math.Max(150, w - fixedCols - SystemInformation.VerticalScrollBarWidth);
-            // the section
-            int x = 12 + w + 12;
-            int bottom = ClientSize.Height - 66 - 40;
-            _view.Location = new Point(x, _top + 44);
-            _view.Size = new Size(Math.Max(300, ClientSize.Width - x - 12), Math.Max(200, bottom - _top - 44));
-            _viewNote.Location = new Point(x, bottom + 14);
-            _viewNote.Width = Math.Max(100, ClientSize.Width - x - 290);
-        }
+            _grid.Columns["Fam"].Width = Math.Max(150, lw - fixedCols - SystemInformation.VerticalScrollBarWidth);
 
-        // the parameter list fills the left side down to the bottom bar
-        private void LayoutParams()
-        {
-            if (_params == null || _bear == null) return;
-            int top = _top + (_bearOn ? 480 : _abutOn ? 430 : _repOn ? 484 : 366);
-            int bottom = ClientSize.Height - 66;
-            _params.Location = new Point(12, top);
-            _params.Size = new Size(LeftW, Math.Max(80, bottom - top));
-            int pw = LeftW - _params.Columns["K"].Width - SystemInformation.VerticalScrollBarWidth - 4;
+            _detHead.SetBounds(rx, top + 2, rw, 18);
+            int py = top + 26;
+            foreach (Panel pn in new[] { _bear, _abutPanel, _repPanel }) pn.SetBounds(rx, py, rw, pn.Height);
+            int ph = _bearOn ? _bear.Height + 6 : _abutOn ? _abutPanel.Height + 6 : _repOn ? _repPanel.Height + 6 : 0;
+            _params.SetBounds(rx, py + ph, rw, Math.Max(80, bottom - py - ph));
+            int pw = rw - _params.Columns["K"].Width - SystemInformation.VerticalScrollBarWidth - 4;
             _params.Columns["N"].Width = Math.Max(150, (int)(pw * 0.6));
             _params.Columns["Val"].Width = Math.Max(100, pw - _params.Columns["N"].Width);
+
+            // bottom bar
+            _line.SetBounds(0, H - bar, W, 1);
+            int yb = H - bar + 10;
+            _prev.Location = new Point(m, yb); _next.Location = new Point(_prev.Right + 6, yb);
+            _closeBtn.Location = new Point(W - m - _closeBtn.Width, yb);
+            _saveBtn.Location = new Point(_closeBtn.Left - 6 - _saveBtn.Width, yb);
+            _createBtn.Location = new Point(_saveBtn.Left - 6 - _createBtn.Width, yb);
+            _see.Location = new Point(_createBtn.Left - 6 - _see.Width, yb);
+            _summary.SetBounds(_next.Right + 12, yb + 7, Math.Max(100, _see.Left - _next.Right - 24), 20);
+        }
+
+        // ---------------------------------------------------------------- the axis cards (real Revit section at every axis)
+
+        private sealed class AxisCard : Panel
+        {
+            public string Axis;
+            public readonly Label Head = new Label { Dock = DockStyle.Top, Height = 24, Padding = new Padding(8, 4, 0, 0), Font = new System.Drawing.Font("Segoe UI Semibold", 9f), Cursor = Cursors.Hand };
+            public readonly Panel Host = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
+            public readonly Label List = new Label { Dock = DockStyle.Bottom, Padding = new Padding(6, 3, 4, 3), Font = new System.Drawing.Font("Segoe UI", 8.5f), Cursor = Cursors.Hand, BackColor = Color.White };
+            public Control Preview;
+            public bool On;
+            public AxisCard()
+            {
+                BackColor = Color.White;
+                Padding = new Padding(2);
+                Controls.Add(Host); Controls.Add(List); Controls.Add(Head);
+            }
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+                using (var pen = new Pen(On ? Orange : Color.FromArgb(207, 213, 221), On ? 2.5f : 1f))
+                    e.Graphics.DrawRectangle(pen, 1, 1, Width - 3, Height - 3);
+            }
+        }
+
+        private readonly List<AxisCard> _cards = new List<AxisCard>();
+        private Panel _cardsPanel;
+        private Form _big;
+
+        private void DropCards()
+        {
+            foreach (AxisCard c in _cards) { try { c.Preview?.Dispose(); c.Dispose(); } catch { } }
+            _cards.Clear();
+            _cardsPanel?.Controls.Clear();
+        }
+
+        // one card per axis; the live section of every axis (the command makes / reuses "AB Section - <axis>")
+        private void BuildCards()
+        {
+            DropCards();
+            if (Excel == null || _cardsPanel == null) return;
+            Cursor old = Cursor.Current;
+            Cursor.Current = Cursors.WaitCursor;
+            try
+            {
+                for (int i = 0; i < Excel.Axes.Count; i++)
+                {
+                    AxisData a = Excel.Axes[i];
+                    int k = i;
+                    var card = new AxisCard { Axis = a.Name };
+                    void Sel() { if (_tabs.SelectedIndex != k) _tabs.SelectedIndex = k; }
+                    card.Head.Click += (s, e) => Sel(); card.List.Click += (s, e) => Sel(); card.Click += (s, e) => Sel();
+                    card.Head.DoubleClick += (s, e) => { Sel(); OpenBig(); };
+                    card.List.DoubleClick += (s, e) => { Sel(); OpenBig(); };
+                    if (_previewOf != null)
+                    {
+                        try
+                        {
+                            Control c = _previewOf(a, "section");
+                            if (c != null) { c.Dock = DockStyle.Fill; card.Host.Controls.Add(c); card.Preview = c; }
+                        }
+                        catch (Exception ex) { card.Host.Controls.Add(new Label { Dock = DockStyle.Fill, Text = "Section not shown: " + ex.Message, ForeColor = Grey, TextAlign = ContentAlignment.MiddleCenter }); }
+                    }
+                    _cards.Add(card);
+                    _cardsPanel.Controls.Add(card);
+                }
+            }
+            finally { Cursor.Current = old; }
+            RefreshCards();
+            LayoutCards();
+        }
+
+        // each card under the bubble of its axis (equal widths; spread evenly when the axes are too close)
+        private void LayoutCards()
+        {
+            int n = _cards.Count;
+            if (n == 0 || _cardsPanel == null) return;
+            int W = _cardsPanel.Width, H = _cardsPanel.Height, gap = 8;
+            int cw = Math.Max(150, Math.Min(330, (W - gap * (n - 1)) / n));
+            var lefts = new int[n];
+            bool even = Excel == null;
+            for (int i = 0; i < n && !even; i++)
+            {
+                float x = _long.ScreenX(Excel.Axes[i].Station);
+                if (float.IsNaN(x)) { even = true; break; }
+                lefts[i] = Math.Max(0, Math.Min(W - cw, (int)(x + _long.Left - _cardsPanel.Left - cw / 2f)));
+                if (i > 0 && lefts[i] < lefts[i - 1] + cw + gap) even = true;
+            }
+            if (even)
+            {
+                cw = Math.Max(120, (W - gap * (n - 1)) / n);
+                for (int i = 0; i < n; i++) lefts[i] = i * (cw + gap);
+            }
+            for (int i = 0; i < n; i++)
+            {
+                AxisCard c = _cards[i];
+                int rows = Math.Min(6, Math.Max(1, c.List.Text.Split('\n').Length));
+                c.List.Height = rows * 15 + 8;
+                c.SetBounds(lefts[i], 0, cw, H);
+            }
+        }
+
+        // the family list and the name of every card
+        private void RefreshCards()
+        {
+            if (Excel == null) return;
+            foreach (AxisCard c in _cards)
+            {
+                AxisData a = Excel.Axes.FirstOrDefault(x => x.Name == c.Axis);
+                SubAxis s = Axes.TryGetValue(c.Axis, out SubAxis v) ? v : null;
+                c.Head.Text = c.Axis + (s == null ? "" : !s.Create ? "  (skip)" : s.HasWork ? "  ✓" : "");
+                var names = s?.Rows.Where(r => !string.IsNullOrEmpty(r.Family)).Select(r => r.Family).ToList() ?? new List<string>();
+                if (s != null && !string.IsNullOrEmpty(s.Abut.Family) && !names.Contains(s.Abut.Family)) names.Insert(0, s.Abut.Family);
+                c.List.Text = names.Count == 0 ? "(no families)" : string.Join("\n", names.Take(6).Select((f, k) => (k + 1) + "  " + f)) + (names.Count > 6 ? $"\n+ {names.Count - 6} more" : "");
+            }
+            MarkCards();
+            LayoutCards();
+        }
+
+        private void MarkCards()
+        {
+            string cur = CurAxis?.Name;
+            foreach (AxisCard c in _cards)
+            {
+                c.On = c.Axis == cur;
+                c.Head.BackColor = c.On ? Navy : Color.FromArgb(243, 244, 246);
+                c.Head.ForeColor = c.On ? Color.White : Navy;
+                c.Invalidate();
+            }
+            _long?.Mark(cur);
+        }
+
+        // the big section of the axis in its own window, with Measure / Fit / Depth / Crop / Section-Plan
+        private void OpenBig()
+        {
+            if (CurAxis == null) return;
+            if (_big != null) { _big.Activate(); ShowPreview(true); return; }
+            _big = new Form { Text = "AB Bridges - Section " + CurAxis.Name, StartPosition = FormStartPosition.CenterParent, ClientSize = new Size(1000, 720),
+                              MinimizeBox = false, Font = Font, BackColor = Color.White, ShowInTaskbar = false };
+            _big.Controls.Add(_view);
+            Brand.AddHeader(_big, "Section");
+            _big.FormClosed += (s, e) =>
+            {
+                DropPreview();
+                try { _big.Controls.Remove(_view); } catch { }
+                _big = null;
+            };
+            _big.Show(this);
+            ShowPreview(true);
+        }
+
+        // .rfa files loaded into the project without opening them (the command does it); every family list gets the new types
+        private static string s_lastDir;
+        private void LoadFamilyFiles()
+        {
+            if (LoadFamilies == null) return;
+            using (var d = new OpenFileDialog { Title = "Load families into the project", Filter = "Revit family (*.rfa)|*.rfa", Multiselect = true })
+            {
+                if (!string.IsNullOrEmpty(s_lastDir) && Directory.Exists(s_lastDir)) d.InitialDirectory = s_lastDir;
+                if (d.ShowDialog(this) != DialogResult.OK || d.FileNames.Length == 0) return;
+                s_lastDir = Path.GetDirectoryName(d.FileNames[0]);
+                int before = _families.Count;
+                List<string> now;
+                Cursor old = Cursor.Current;
+                Cursor.Current = Cursors.WaitCursor;
+                try { now = LoadFamilies(d.FileNames); }
+                catch (Exception ex) { _summary.ForeColor = Red; _summary.Text = "Could not load: " + ex.Message; return; }
+                finally { Cursor.Current = old; }
+                if (now == null) return;
+                var added = now.Except(_families, StringComparer.OrdinalIgnoreCase).ToList();
+                _families.Clear(); _families.AddRange(now);
+                _summary.ForeColor = Green;
+                _summary.Text = $"✓ {d.FileNames.Length} famil{(d.FileNames.Length == 1 ? "y" : "ies")} loaded ({added.Count} new type(s))" + (added.Count > 0 ? ": " + string.Join(", ", added.Take(4)) : "");
+            }
         }
 
         // ---------------------------------------------------------------- details

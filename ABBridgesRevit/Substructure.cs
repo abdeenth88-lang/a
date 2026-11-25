@@ -257,10 +257,86 @@ namespace ABBridgesRevit
                 }
                 catch { }
             }
+            try { Sand(doc, vs, geo, a, dx, dy, ids); } catch { }        // first: the lines / texts made after it are drawn over it
             Draw(a.Design, "AB Design surface", 37, 99, 235, "Design surface");
-            Draw(a.Ngl, "AB NGL", 77, 124, 15, "NGL");
+            Draw(a.Ngl, "AB NGL", 133, 79, 11, "NGL");
             try { SectionDims(doc, vs, geo, a, dx, dy, ids); } catch { }
             map[LinesKey + a.Name] = AbStore.Ids(ids);
+        }
+
+        // the natural ground under the NGL: desert yellow (light, like 35 % on white), with holes where the
+        // elements are cut (piles, pile caps ... stay visible: a filled region is drawn over the model)
+        private static void Sand(Document doc, ViewSection vs, Geo geo, AxisData a, double dx, double dy, List<ElementId> ids)
+        {
+            var p = a.Ngl.Where(x => !double.IsNaN(x.z) && !double.IsNaN(x.off)).OrderBy(x => x.off).ToList();
+            if (p.Count < 2) return;
+            double depth = 6.0;                                              // m under the lowest NGL point
+            double zb = p.Min(x => x.z) - depth;
+            XYZ At(double off, double z) => geo.ToInternal(a.X + dx * off, a.Y + dy * off, z);
+            var pts = p.Select(x => At(x.off, x.z)).ToList();
+            pts.Add(At(p[p.Count - 1].off, zb)); pts.Add(At(p[0].off, zb));
+            var outer = new CurveLoop();
+            for (int i = 0; i < pts.Count; i++) { XYZ q0 = pts[i], q1 = pts[(i + 1) % pts.Count]; if (q0.DistanceTo(q1) > 1e-4) outer.Append(Line.CreateBound(q0, q1)); }
+
+            // the ground as a thin solid in the view plane, minus the cut elements
+            XYZ u = geo.Vec(dx, dy), nrm = XYZ.BasisZ.CrossProduct(u).Normalize();
+            double th = 0.01;
+            Solid ground = GeometryCreationUtilities.CreateExtrudedGeometry(new[] { outer }, nrm, th);
+            XYZ p0 = geo.ToInternal(a.X, a.Y, 0);
+            Plane pl = Plane.CreateByNormalAndOrigin(nrm, p0);
+            var opt = new Options { ComputeReferences = false, DetailLevel = ViewDetailLevel.Fine };
+            long topo1 = (long)BuiltInCategory.OST_Topography, topo2 = (long)BuiltInCategory.OST_Toposolid;
+            foreach (Element e in new FilteredElementCollector(doc, vs.Id).WhereElementIsNotElementType().ToElements())
+            {
+                try
+                {
+                    Category c = e.Category;
+                    if (c == null || c.CategoryType != CategoryType.Model || !(e is FamilyInstance)) continue;
+                    if (c.Id.Value == topo1 || c.Id.Value == topo2) continue;
+                    foreach (var loop in Cut(e, opt, pl, p0, u, nrm, geo))
+                    {
+                        if (loop.Count < 3) continue;
+                        var cl = new CurveLoop();
+                        var lp = loop.Select(q => At(q.off, q.z)).ToList();
+                        for (int i = 0; i < lp.Count; i++) { XYZ q0 = lp[i], q1 = lp[(i + 1) % lp.Count]; if (q0.DistanceTo(q1) > 1e-4) cl.Append(Line.CreateBound(q0, q1)); }
+                        try
+                        {
+                            Solid hole = GeometryCreationUtilities.CreateExtrudedGeometry(new[] { cl }, nrm, th);
+                            ground = BooleanOperationsUtils.ExecuteBooleanOperation(ground, hole, BooleanOperationsType.Difference);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+            // the face of the solid in the view plane -> the loops of the filled region
+            PlanarFace face = ground.Faces.OfType<PlanarFace>().FirstOrDefault(fc => fc.FaceNormal.IsAlmostEqualTo(nrm.Negate()) || fc.FaceNormal.IsAlmostEqualTo(nrm));
+            if (face == null) return;
+            IList<CurveLoop> loops = face.GetEdgesAsCurveLoops();
+            XYZ back = face.Origin.Subtract(p0).DotProduct(nrm) * nrm;          // onto the section plane
+            var flat = loops.Select(l => CurveLoop.CreateViaTransform(l, Transform.CreateTranslation(back.Negate()))).ToList();
+            FilledRegionType frt = SandType(doc);
+            if (frt == null) return;
+            ids.Add(FilledRegion.Create(doc, frt.Id, vs.Id, flat).Id);
+        }
+
+        // "AB Sand": solid fill, desert yellow (239,159,39 at 35 % on white), no outline weight change
+        private static FilledRegionType SandType(Document doc)
+        {
+            const string name = "AB Sand";
+            var all = new FilteredElementCollector(doc).OfClass(typeof(FilledRegionType)).Cast<FilledRegionType>().ToList();
+            FilledRegionType t = all.FirstOrDefault(x => x.Name == name);
+            if (t != null) return t;
+            FilledRegionType basis = all.FirstOrDefault();
+            FillPatternElement solid = new FilteredElementCollector(doc).OfClass(typeof(FillPatternElement)).Cast<FillPatternElement>()
+                .FirstOrDefault(f => f.GetFillPattern().IsSolidFill);
+            if (basis == null || solid == null) return basis;
+            t = basis.Duplicate(name) as FilledRegionType;
+            t.ForegroundPatternId = solid.Id;
+            t.ForegroundPatternColor = new Autodesk.Revit.DB.Color(250, 227, 190);
+            t.BackgroundPatternId = ElementId.InvalidElementId;
+            t.IsMasking = false;
+            return t;
         }
 
         // dimensions of every element cut at the axis: width under it, height beside it, top level above it
@@ -311,8 +387,8 @@ namespace ABBridgesRevit
             }
         }
 
-        // the look of the section: what Substructure placed in orange, everything else cut (the deck ...) in light grey,
-        // solid cut fill, no crop frame, fine detail, hidden lines off
+        // the look of the section, like the drawings: black lines, the cut pattern of each material (concrete hatch ...),
+        // no colours, no crop frame, fine detail, hidden lines off
         private static void StyleSection(Document doc, ViewSection vs, Dictionary<string, string> map)
         {
             try
@@ -338,7 +414,15 @@ namespace ABBridgesRevit
                     }
                     return o;
                 }
-                OverrideGraphicSettings sub = Ogs(253, 220, 196, 194, 65, 12, 4), other = Ogs(226, 229, 234, 75, 85, 99, 3);
+                // black lines only (the material's own cut pattern stays); what Substructure placed a bit heavier
+                OverrideGraphicSettings Black(int w)
+                {
+                    var o = new OverrideGraphicSettings();
+                    var k = new Autodesk.Revit.DB.Color(0, 0, 0);
+                    o.SetCutLineColor(k); o.SetCutLineWeight(w); o.SetProjectionLineColor(k);
+                    return o;
+                }
+                OverrideGraphicSettings sub = Black(4), other = Black(3);
                 foreach (Element e in new FilteredElementCollector(doc, vs.Id).WhereElementIsNotElementType().ToElements())
                 {
                     try
@@ -675,6 +759,23 @@ namespace ABBridgesRevit
             {
                 formRef = form;
                 form.LongOf = bxl => BuildLong(doc, geo, bxl, Decks(doc));
+                form.LoadFamilies = files =>
+                {
+                    using (var t = new Transaction(doc, "AB Bridges - load families"))
+                    {
+                        t.Start();
+                        var opts = new AskLoadOpts();
+                        foreach (string f in files)
+                        {
+                            try { doc.LoadFamily(f, opts, out Family _); } catch { }
+                        }
+                        t.Commit();
+                    }
+                    Dictionary<string, FamilySymbol> fresh = Families(doc);
+                    syms.Clear();
+                    foreach (var kv in fresh) syms[kv.Key] = kv.Value;
+                    return syms.Keys.ToList();
+                };
                 form.StartAxis = startAxis;
                 form.StartRow = startRow;
                 form.PlanViews = planViews;
@@ -755,6 +856,23 @@ namespace ABBridgesRevit
         // ---------------------------------------------------------------- families
 
         // every family type of the project that makes model geometry (any category, any placement): "Family : Type"
+        // a family already in the project: ask once whether to overwrite it (and its parameter values)
+        private sealed class AskLoadOpts : IFamilyLoadOptions
+        {
+            private bool? _answer;
+            private bool Ask()
+            {
+                if (_answer == null)
+                    _answer = System.Windows.Forms.MessageBox.Show("Some families are already in the project.\n\nOverwrite them with the files?",
+                        "AB Bridges - load families", System.Windows.Forms.MessageBoxButtons.YesNo, System.Windows.Forms.MessageBoxIcon.Question)
+                        == System.Windows.Forms.DialogResult.Yes;
+                return _answer.Value;
+            }
+            public bool OnFamilyFound(bool familyInUse, out bool overwriteParameterValues) { bool y = Ask(); overwriteParameterValues = y; return y; }
+            public bool OnSharedFamilyFound(Family sharedFamily, bool familyInUse, out FamilySource source, out bool overwriteParameterValues)
+            { bool y = Ask(); source = FamilySource.Family; overwriteParameterValues = y; return y; }
+        }
+
         private static Dictionary<string, FamilySymbol> Families(Document doc)
         {
             var res = new SortedDictionary<string, FamilySymbol>(StringComparer.OrdinalIgnoreCase);

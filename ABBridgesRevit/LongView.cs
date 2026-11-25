@@ -81,11 +81,19 @@ namespace ABBridgesRevit
         public float Exaggerate = 3f;                 // levels drawn this many times taller (dims stay true)
         public event Action<string> AxisClicked;
         private readonly List<(RectangleF r, string name)> _hits = new List<(RectangleF, string)>();
+        private string _marked;
 
+        // drawing look (like the drawings): concrete hatch, black lines, desert-yellow ground
         private static readonly Color Sand = Color.FromArgb(90, 239, 159, 39);
-        private static readonly Color Concrete = Color.FromArgb(211, 209, 199);
-        private static readonly Color Deck = Color.FromArgb(200, 214, 232);
-        private static readonly Color Ink = Color.FromArgb(68, 68, 65);
+        private static readonly Color Ink = Color.Black;
+        private const float PadT = 64, PadB = 30, PadL = 14, PadR = 14;
+
+        // barrier of the road below (m): 0.40 wide at the bottom, 0.20 at the top, 1.20 high, New Jersey traffic face
+        public static readonly (double x, double z)[] Barrier =
+        {
+            (0, 0), (0, 0.08), (-0.12, 0.33), (-0.20, 1.20), (-0.40, 1.20), (-0.40, 0)
+        };
+        public const double PaveT = 0.25;            // pavement thickness drawn under the FRL (m)
 
         public LongView()
         {
@@ -98,51 +106,87 @@ namespace ABBridgesRevit
             };
         }
 
+        public void Mark(string axis) { if (_marked != axis) { _marked = axis; Invalidate(); } }
+
+        // the screen x of a station (NaN when nothing is drawn yet); used to put the axis cards under the bubbles
+        public float ScreenX(double sta)
+        {
+            if (!Frame(out double x0, out double sx, out _, out _)) return float.NaN;
+            return (float)(PadL + (sta - x0) * sx);
+        }
+
+        private bool Frame(out double x0, out double sx, out double z0, out double sz)
+        {
+            x0 = sx = z0 = sz = 0;
+            LongData d = Data;
+            var pts = d == null ? new List<(double x, double z)>() : d.Loops.SelectMany(l => l.loop).Concat(d.Ground).ToList();
+            if (d == null || pts.Count == 0 || d.Axes.Count == 0) return false;
+            x0 = Math.Min(pts.Min(p => p.x), d.Axes.Min(a => a.x));
+            double x1 = Math.Max(pts.Max(p => p.x), d.Axes.Max(a => a.x));
+            z0 = pts.Min(p => p.z);
+            double z1 = pts.Max(p => p.z);
+            sx = (Width - PadL - PadR) / Math.Max(1e-6, x1 - x0);
+            sz = Math.Min(sx * Exaggerate, (Height - PadT - PadB) / Math.Max(1e-6, z1 - z0));
+            return true;
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             _hits.Clear();
             LongData d = Data;
-            var pts = d == null ? new List<(double x, double z)>() : d.Loops.SelectMany(l => l.loop).Concat(d.Ground).ToList();
-            if (d == null || pts.Count == 0 || d.Axes.Count == 0)
+            if (!Frame(out double x0, out double sx, out double z0, out double sz))
             {
                 TextRenderer.DrawText(g, Message, Font, ClientRectangle, Color.Gray, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 return;
             }
-            double x0 = Math.Min(pts.Min(p => p.x), d.Axes.Min(a => a.x)), x1 = Math.Max(pts.Max(p => p.x), d.Axes.Max(a => a.x));
-            double z0 = pts.Min(p => p.z), z1 = pts.Max(p => p.z);
-            float top = 64, bottom = 30, left = 14, right = 14;
-            double sx = (Width - left - right) / Math.Max(1e-6, x1 - x0);
-            double sz = Math.Min(sx * Exaggerate, (Height - top - bottom) / Math.Max(1e-6, z1 - z0));
-            Func<double, double, PointF> P = (x, z) => new PointF((float)(left + (x - x0) * sx), (float)(Height - bottom - (z - z0) * sz));
-            float yGround = Height - bottom;
+            Func<double, double, PointF> P = (x, z) => new PointF((float)(PadL + (x - x0) * sx), (float)(Height - PadB - (z - z0) * sz));
+            float yGround = Height - PadB;
 
-            using (var f = new Font("Segoe UI", 8f))
-            using (var fb = new Font("Segoe UI Semibold", 8f))
-            using (var ink = new Pen(Ink, 0.7f))
+            using (var f = new Font("Arial", 8f))
+            using (var fb = new Font("Arial", 8f, FontStyle.Bold))
+            using (var ink = new Pen(Ink, 0.9f))
+            using (var conc = new HatchBrush(HatchStyle.DottedGrid, Color.FromArgb(150, 150, 150), Color.FromArgb(237, 237, 237)))
+            using (var deckB = new HatchBrush(HatchStyle.Percent10, Color.FromArgb(140, 140, 140), Color.FromArgb(242, 242, 242)))
             {
-                // ground: sand under the FGL line
+                // ground: desert yellow under the FGL line
                 if (d.Ground.Count > 1)
                 {
                     var gp = d.Ground.OrderBy(p => p.x).Select(p => P(p.x, p.z)).ToList();
                     var poly = new List<PointF>(gp) { new PointF(gp.Last().X, Height), new PointF(gp[0].X, Height) };
                     using (var b = new SolidBrush(Sand)) g.FillPolygon(b, poly.ToArray());
                     using (var pen = new Pen(Color.FromArgb(133, 79, 11), 1.1f)) g.DrawLines(pen, gp.ToArray());
-                    g.DrawString("FGL", f, Brushes.SaddleBrown, gp[gp.Count / 3].X, gp[gp.Count / 3].Y - 14);
+                    PointF fg = gp[gp.Count / 3];
+                    g.DrawString("FGL", f, Brushes.Black, fg.X - 8, fg.Y - 22);
+                    g.FillPolygon(Brushes.Black, new[] { new PointF(fg.X - 4, fg.Y - 8), new PointF(fg.X + 4, fg.Y - 8), new PointF(fg.X, fg.Y - 1) });
                 }
-                // the cut elements (deck light blue, substructure concrete)
+                // the cut elements: concrete hatch, black outline (deck lighter)
                 foreach (var l in d.Loops.Where(x => x.loop.Count > 2))
                 {
                     PointF[] pp = l.loop.Select(q => P(q.x, q.z)).ToArray();
-                    using (var b = new SolidBrush(l.deck ? Deck : Concrete)) g.FillPolygon(b, pp);
+                    g.FillPolygon(l.deck ? (Brush)deckB : conc, pp);
                     g.DrawPolygon(ink, pp);
                 }
-                // roads below: FRL line + symbol + min vertical clearance under the deck
+                // roads below: pavement + a barrier outside each edge, FRL symbol, min vertical clearance under the deck
                 foreach (var rd in d.Roads.Where(r => r.pts.Count > 0))
                 {
                     var rp = rd.pts.OrderBy(p => p.x).ToList();
-                    if (rp.Count > 1) using (var pen = new Pen(Color.Black, 1.6f)) g.DrawLines(pen, rp.Select(p => P(p.x, p.z)).ToArray());
+                    if (rp.Count > 1)
+                    {
+                        var top = rp.Select(p => P(p.x, p.z)).ToList();
+                        var pave = new List<PointF>(top);
+                        pave.AddRange(rp.AsEnumerable().Reverse().Select(p => P(p.x, p.z - PaveT)));
+                        using (var asph = new HatchBrush(HatchStyle.Percent50, Color.FromArgb(70, 70, 70), Color.FromArgb(110, 110, 110))) g.FillPolygon(asph, pave.ToArray());
+                        g.DrawPolygon(ink, pave.ToArray());
+                        // barriers: traffic face towards the road, outside its first / last point
+                        foreach (var (px, pz, side) in new[] { (rp[0].x, rp[0].z, 1.0), (rp[rp.Count - 1].x, rp[rp.Count - 1].z, -1.0) })
+                        {
+                            PointF[] bp = Barrier.Select(q => P(px + side * q.x, pz - PaveT + q.z)).ToArray();
+                            g.FillPolygon(conc, bp);
+                            g.DrawPolygon(ink, bp);
+                        }
+                    }
                     double best = double.MaxValue, bx = double.NaN, bz = double.NaN, bs = double.NaN;
                     foreach (var p in rp)
                     {
@@ -161,17 +205,18 @@ namespace ABBridgesRevit
                         g.DrawString(best.ToString("0.000") + "  MIN VERTICAL CLEARANCE", f, Brushes.Black, a.X + 4, (a.Y + b.Y) / 2 - 6);
                     }
                 }
-                // axes: bubble + dashed line, span dims on top with "Span n" under, type under the bridge
+                // axes: bubble + dashed line, span dims on top with "Span n" under, type under the bridge; the open axis in orange
                 var ax = d.Axes.OrderBy(a => a.x).ToList();
-                using (var dash = new Pen(Color.Gray, 0.6f) { DashPattern = new[] { 5f, 3f } })
+                using (var dash = new Pen(Color.Gray, 0.6f) { DashPattern = new[] { 8f, 3f, 2f, 3f } })
                 using (var dim = new Pen(Ink, 0.7f) { CustomStartCap = new AdjustableArrowCap(3, 4), CustomEndCap = new AdjustableArrowCap(3, 4) })
+                using (var mark = new Pen(Color.FromArgb(232, 121, 43), 2.4f))
                 {
                     for (int i = 0; i < ax.Count; i++)
                     {
                         float x = P(ax[i].x, z0).X;
-                        g.DrawLine(dash, x, 24, x, yGround);
-                        var rc = new RectangleF(x - 13, 4, 26, 20);
-                        g.FillEllipse(Brushes.White, rc); g.DrawEllipse(ink, rc);
+                        g.DrawLine(dash, x, 26, x, yGround);
+                        var rc = new RectangleF(x - 11, 3, 22, 22);
+                        g.FillEllipse(Brushes.White, rc); g.DrawEllipse(ax[i].name == _marked ? mark : ink, rc);
                         TextRenderer.DrawText(g, ax[i].name, f, Rectangle.Round(rc), Color.Black, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                         _hits.Add((rc, ax[i].name));
                         if (!string.IsNullOrEmpty(ax[i].type))
@@ -182,13 +227,13 @@ namespace ABBridgesRevit
                         if (i + 1 < ax.Count)
                         {
                             float xn = P(ax[i + 1].x, z0).X;
-                            g.DrawLine(dim, x, 34, xn, 34);
+                            g.DrawLine(dim, x, 36, xn, 36);
                             string t = (ax[i + 1].x - ax[i].x).ToString("0.000");
                             SizeF ts = g.MeasureString(t, fb);
-                            if (ts.Width < xn - x) g.DrawString(t, fb, Brushes.Black, (x + xn - ts.Width) / 2, 20 + 1);
-                            string sp = "Span " + (i + 1);
+                            if (ts.Width < xn - x) g.DrawString(t, fb, Brushes.Black, (x + xn - ts.Width) / 2, 22);
+                            string sp = "SPAN " + (i + 1);
                             SizeF s2 = g.MeasureString(sp, f);
-                            if (s2.Width < xn - x) g.DrawString(sp, f, Brushes.Gray, (x + xn - s2.Width) / 2, 36);
+                            if (s2.Width < xn - x) g.DrawString(sp, f, Brushes.Black, (x + xn - s2.Width) / 2, 38);
                         }
                     }
                 }
