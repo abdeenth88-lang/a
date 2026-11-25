@@ -1,0 +1,114 @@
+rules_version = '2';
+
+// Security rules for the chat app.
+//   usernames/{username}           -> { uid }                 (reserves a unique username)
+//   users/{uid}                    -> { username, name, createdAt }
+//   chats/{chatId}                 -> { type: 'direct'|'group', members[], admins[], name, createdBy, lastMessage, updatedAt }
+//   chats/{chatId}/messages/{id}   -> { senderId, text, ts }
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function authed() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function validUsername(n) { return n is string && n.matches('^[a-z0-9_]{3,20}$'); }
+    function validName(n, max) { return n is string && n.size() > 0 && n.size() <= max; }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function usernamePath(n) { return /databases/$(database)/documents/usernames/$(n); }
+
+    match /usernames/{name} {
+      allow read: if authed();
+      // Created in the same batch as the user's profile.
+      allow create: if authed() && validUsername(name)
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == me()
+        && !exists(userPath(me()))
+        && getAfter(userPath(me())).data.username == name;
+      allow update, delete: if false;
+    }
+
+    match /users/{uid} {
+      allow read: if authed();
+      allow create: if authed() && uid == me()
+        && request.resource.data.keys().hasOnly(['username', 'name', 'createdAt'])
+        && validUsername(request.resource.data.username)
+        && validName(request.resource.data.name, 40)
+        && request.resource.data.createdAt == request.time
+        && getAfter(usernamePath(request.resource.data.username)).data.uid == me();
+      // Only the display name can change; the username is permanent.
+      allow update: if authed() && uid == me()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name'])
+        && validName(request.resource.data.name, 40);
+      allow delete: if false;
+    }
+
+    match /chats/{chatId} {
+      function isMember() { return me() in resource.data.members; }
+      function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+      function newData() { return request.resource.data; }
+
+      // A direct chat that doesn't exist yet may be looked up by either of its two people.
+      allow get: if authed() && (resource == null ? me() in chatId.split('_') : isMember());
+      allow list: if authed() && isMember();
+
+      allow create: if authed()
+        && newData().createdBy == me()
+        && newData().members is list
+        && me() in newData().members
+        && newData().updatedAt == request.time
+        && newData().lastMessage == null
+        && (
+          (newData().type == 'direct'
+            && newData().keys().hasOnly(['type', 'members', 'createdBy', 'updatedAt', 'lastMessage'])
+            && newData().members.size() == 2
+            && newData().members[0] < newData().members[1]
+            && chatId == newData().members[0] + '_' + newData().members[1]
+            && exists(userPath(newData().members[0]))
+            && exists(userPath(newData().members[1])))
+          ||
+          (newData().type == 'group'
+            && newData().keys().hasOnly(['type', 'members', 'createdBy', 'updatedAt', 'lastMessage', 'admins', 'name'])
+            && newData().members.size() >= 2
+            && newData().members.size() <= 256
+            && newData().admins == [me()]
+            && validName(newData().name, 60))
+        );
+
+      allow update: if authed() && isMember() && (
+        // Any member: record the latest message (sent in the same batch as the message).
+        (changed().hasOnly(['lastMessage', 'updatedAt'])
+          && newData().lastMessage.senderId == me()
+          && newData().updatedAt == request.time)
+        ||
+        // Group admin: rename the group, add or remove members.
+        (resource.data.type == 'group'
+          && me() in resource.data.admins
+          && changed().hasOnly(['name', 'members', 'updatedAt'])
+          && me() in newData().members
+          && newData().members.size() <= 256
+          && validName(newData().name, 60))
+        ||
+        // Any member: leave a group. If the only admin leaves, the next member becomes admin.
+        (resource.data.type == 'group'
+          && changed().hasOnly(['members', 'admins', 'updatedAt'])
+          && newData().members.toSet() == resource.data.members.toSet().difference([me()].toSet())
+          && newData().members.size() == resource.data.members.size() - 1
+          && (newData().admins.toSet() == resource.data.admins.toSet().difference([me()].toSet())
+              || (resource.data.admins == [me()]
+                  && newData().members.size() > 0
+                  && newData().admins == [newData().members[0]])))
+      );
+      allow delete: if false;
+
+      match /messages/{msgId} {
+        function chat() { return get(/databases/$(database)/documents/chats/$(chatId)).data; }
+        allow read: if authed() && me() in chat().members;
+        allow create: if authed() && me() in chat().members
+          && request.resource.data.keys().hasOnly(['senderId', 'text', 'ts'])
+          && request.resource.data.senderId == me()
+          && validName(request.resource.data.text, 4000)
+          && request.resource.data.ts == request.time;
+        allow update, delete: if false;
+      }
+    }
+  }
+}
