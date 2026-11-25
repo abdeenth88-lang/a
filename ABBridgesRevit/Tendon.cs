@@ -545,72 +545,95 @@ namespace ABBridgesRevit
                     }
                     if (made3D.Count > 0) log.AppendLine($"{made3D.Count} 3D tendon(s) made.");
 
-                    // like the Parsons sheets: one sheet per path x stage; a long stage is cut into parts stacked
-                    // on the sheet (FOR CONTINUATION, SEE BELOW / ABOVE); data table and notes at the bottom left
+                    // one sheet per stage: path 1 over path 2 (each view with its data table on the right), notes at the
+                    // bottom left. A stage longer than the sheet goes on more sheets of the same layout (part 1, 2 ...).
                     FamilySymbol tb = new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_TitleBlocks).OfClass(typeof(FamilySymbol))
                         .Cast<FamilySymbol>().FirstOrDefault(x => x.FamilyName + " : " + x.Name == form.TitleBlock);
                     ViewFamilyType vft = new FilteredElementCollector(doc).OfClass(typeof(ViewFamilyType)).Cast<ViewFamilyType>().FirstOrDefault(x => x.ViewFamily == ViewFamily.Drafting);
                     if (vft == null) log.AppendLine("No drafting view type in the project.");
+                    FamilySymbol col = TendonDraw.TableFamily(doc, log);
                     int nSheets = 0;
-                    foreach (TendonProfile p in set.Profiles)
+                    for (int stage = 1; stage <= set.Stages && vft != null; stage++)
                     {
-                        if (vft == null) break;
-                        string pk = p.Stage + "|" + p.Path;
-                        var parts = TendonDraw.Parts(g, set, p, 150);
-                        // views of parts that are no longer needed go
-                        for (int k = parts.Count + 1; k <= 6; k++)
-                            if (map.TryGetValue(ViewKey + pk + "|" + k, out string ov) && long.TryParse(ov, out long lo))
-                            { try { doc.Delete(new ElementId(lo)); } catch { } map.Remove(ViewKey + pk + "|" + k); map.Remove(IdsKey + "2D|" + pk + "|" + k); }
-                        var pv = new List<View>();
-                        for (int k = 1; k <= parts.Count; k++)
+                        // views of every path of this stage, per part
+                        var views = new Dictionary<(int path, int part), View>();
+                        int nParts = 1;
+                        List<TendonProfile> paths = set.Profiles.Where(x => x.Stage == stage).OrderBy(x => x.Path).ToList();
+                        foreach (TendonProfile p in paths)
                         {
-                            string vk = ViewKey + pk + "|" + k;
-                            View v = map.TryGetValue(vk, out string vid) && long.TryParse(vid, out long l2) ? doc.GetElement(new ElementId(l2)) as View : null;
-                            if (v == null)
+                            string pk = p.Stage + "|" + p.Path;
+                            var parts = TendonDraw.Parts(g, set, p, 150);
+                            nParts = Math.Max(nParts, parts.Count);
+                            for (int k = parts.Count + 1; k <= 6; k++)
+                                if (map.TryGetValue(ViewKey + pk + "|" + k, out string ov) && long.TryParse(ov, out long lo))
+                                { try { doc.Delete(new ElementId(lo)); } catch { } map.Remove(ViewKey + pk + "|" + k); map.Remove(IdsKey + "2D|" + pk + "|" + k); }
+                            for (int k = 1; k <= parts.Count; k++)
                             {
-                                v = ViewDrafting.Create(doc, vft.Id);
-                                try { v.Name = $"AB Tendon - Path {p.Path} - Stage {p.Stage}" + (parts.Count > 1 ? $" - Part {k}" : ""); } catch { }
-                                v.Scale = 150;
-                                map[vk] = v.Id.Value.ToString(CI);
+                                string vk = ViewKey + pk + "|" + k;
+                                View v = map.TryGetValue(vk, out string vid) && long.TryParse(vid, out long l2) ? doc.GetElement(new ElementId(l2)) as View : null;
+                                if (v == null)
+                                {
+                                    v = ViewDrafting.Create(doc, vft.Id);
+                                    try { v.Name = $"AB Tendon - Path {p.Path} - Stage {p.Stage}" + (parts.Count > 1 ? $" - Part {k}" : ""); } catch { }
+                                    v.Scale = 150;
+                                    map[vk] = v.Id.Value.ToString(CI);
+                                }
+                                string dk = IdsKey + "2D|" + pk + "|" + k;
+                                if (map.TryGetValue(dk, out string old))
+                                    foreach (string sid in old.Split(',')) if (long.TryParse(sid, out long l3)) { try { doc.Delete(new ElementId(l3)); } catch { } }
+                                List<ElementId> ids = TendonDraw.Draw(doc, v, g, set, p, form.VScale, parts[k - 1].a, parts[k - 1].b, k, parts.Count, col);
+                                map[dk] = string.Join(",", ids.Select(i => i.Value.ToString(CI)));
+                                views[(p.Path, k)] = v;
                             }
-                            string dk = IdsKey + "2D|" + pk + "|" + k;
-                            if (map.TryGetValue(dk, out string old))
-                                foreach (string sid in old.Split(',')) if (long.TryParse(sid, out long l3)) { try { doc.Delete(new ElementId(l3)); } catch { } }
-                            List<ElementId> ids = TendonDraw.Draw(doc, v, g, set, p, form.VScale, parts[k - 1].a, parts[k - 1].b, k, parts.Count);
-                            map[dk] = string.Join(",", ids.Select(i => i.Value.ToString(CI)));
-                            pv.Add(v);
                         }
 
-                        // the sheet: made once, kept on Update; missing parts are placed, the data table / notes redrawn
-                        string sk = SheetKey + pk;
-                        ViewSheet sheet = map.TryGetValue(sk, out string shv) && long.TryParse(shv, out long l4) ? doc.GetElement(new ElementId(l4)) as ViewSheet : null;
-                        if (sheet == null)
+                        for (int part = 1; part <= nParts; part++)
                         {
-                            if (update) continue;
-                            sheet = ViewSheet.Create(doc, tb?.Id ?? ElementId.InvalidElementId);
-                            try { sheet.Name = $"TENDON PROFILE - PATH {p.Path} - STAGE {p.Stage}"; sheet.SheetNumber = $"AB-TP-{p.Stage:00}-{p.Path}"; } catch { }
-                            map[sk] = sheet.Id.Value.ToString(CI);
-                            nSheets++;
+                            // the sheet: made once, kept on Update; missing views are placed, the data tables / notes redrawn
+                            string sk = SheetKey + "S" + stage + "|" + part;
+                            ViewSheet sheet = map.TryGetValue(sk, out string shv) && long.TryParse(shv, out long l4) ? doc.GetElement(new ElementId(l4)) as ViewSheet : null;
+                            if (sheet == null)
+                            {
+                                if (update) continue;
+                                sheet = ViewSheet.Create(doc, tb?.Id ?? ElementId.InvalidElementId);
+                                try
+                                {
+                                    sheet.Name = $"WEB POST-TENSIONING PROFILE - STAGE {stage}" + (nParts > 1 ? $" ({part} OF {nParts})" : "");
+                                    sheet.SheetNumber = $"AB-TP-{stage:00}" + (nParts > 1 ? "-" + part : "");
+                                }
+                                catch { }
+                                map[sk] = sheet.Id.Value.ToString(CI);
+                                nSheets++;
+                            }
+                            BoundingBoxUV o = sheet.Outline;
+                            double W = o.Max.U - o.Min.U, H = o.Max.V - o.Min.V;
+                            if (W < Ft(0.2)) { W = Ft(0.841); H = Ft(0.594); o = new BoundingBoxUV(0, 0, W, H); }
+                            double tableW = Ft(0.095);                                   // data table at the right of every view
+                            double right = o.Min.U + W * 0.97 - tableW;                  // views end here
+                            double zoneTop = o.Max.V - H * 0.05, zoneBot = o.Min.V + H * 0.25;   // notes / title block below
+                            var onSheet = paths.Where(q => views.ContainsKey((q.Path, part))).ToList();
+                            var placed = new HashSet<ElementId>(sheet.GetAllPlacedViews());
+                            string sdk = IdsKey + "SHEET|S" + stage + "|" + part;
+                            if (map.TryGetValue(sdk, out string olds))
+                                foreach (string sid in olds.Split(',')) if (long.TryParse(sid, out long l5)) { try { doc.Delete(new ElementId(l5)); } catch { } }
+                            var sids = new List<ElementId>();
+                            for (int k = 0; k < onSheet.Count; k++)
+                            {
+                                TendonProfile p = onSheet[k];
+                                View v = views[(p.Path, part)];
+                                double cv = zoneTop - (zoneTop - zoneBot) * (k + 0.5) / onSheet.Count;
+                                double cu = (o.Min.U + W * 0.03 + right) / 2;
+                                Viewport vp = new FilteredElementCollector(doc, sheet.Id).OfClass(typeof(Viewport)).Cast<Viewport>().FirstOrDefault(x => x.ViewId == v.Id);
+                                if (vp == null && !placed.Contains(v.Id) && Viewport.CanAddViewToSheet(doc, sheet.Id, v.Id))
+                                    vp = Viewport.Create(doc, sheet.Id, v.Id, new XYZ(cu, cv, 0));
+                                // the data table: right of the view, at the height of the box
+                                double top = cv + H * 0.06;
+                                if (vp != null) { Outline bo = vp.GetBoxOutline(); top = bo.MaximumPoint.Y - (bo.MaximumPoint.Y - bo.MinimumPoint.Y) * 0.35; }
+                                sids.AddRange(TendonDraw.Data(doc, sheet, new XYZ(o.Min.U + W * 0.97 - tableW, top, 0), 1.0 / 1000, p, JackLabel(g, set, p)));
+                            }
+                            sids.AddRange(TendonDraw.Notes(doc, sheet, new XYZ(o.Min.U + W * 0.04, o.Min.V + H * 0.20, 0), paths.FirstOrDefault()));
+                            map[sdk] = string.Join(",", sids.Select(i => i.Value.ToString(CI)));
                         }
-                        BoundingBoxUV o = sheet.Outline;
-                        double W = o.Max.U - o.Min.U, H = o.Max.V - o.Min.V;
-                        if (W < Ft(0.2)) { W = Ft(0.841); H = Ft(0.594); o = new BoundingBoxUV(0, 0, W, H); }
-                        double right = o.Min.U + W * 0.80;                       // the title block column at the right
-                        double zoneTop = o.Max.V - H * 0.06, zoneBot = o.Min.V + H * 0.12;
-                        var placed = new HashSet<ElementId>(sheet.GetAllPlacedViews());
-                        for (int k = 0; k < pv.Count; k++)
-                        {
-                            if (placed.Contains(pv[k].Id) || !Viewport.CanAddViewToSheet(doc, sheet.Id, pv[k].Id)) continue;
-                            double cv = zoneTop - (zoneTop - zoneBot) * (k + 0.5) / pv.Count;
-                            double cu = k == 0 ? (o.Min.U + right) / 2 : (o.Min.U + right) / 2 + W * 0.08;   // the lower part sits a bit to the right, the table at its left
-                            Viewport.Create(doc, sheet.Id, pv[k].Id, new XYZ(cu, cv, 0));
-                        }
-                        string sdk = IdsKey + "SHEET|" + pk;
-                        if (map.TryGetValue(sdk, out string olds))
-                            foreach (string sid in olds.Split(',')) if (long.TryParse(sid, out long l5)) { try { doc.Delete(new ElementId(l5)); } catch { } }
-                        var sids = TendonDraw.Data(doc, sheet, new XYZ(o.Min.U + W * 0.27, o.Min.V + H * 0.35, 0), 1.0 / 1000, p);
-                        sids.AddRange(TendonDraw.Notes(doc, sheet, new XYZ(o.Min.U + W * 0.04, o.Min.V + H * 0.17, 0), p));
-                        map[sdk] = string.Join(",", sids.Select(i => i.Value.ToString(CI)));
                     }
                     if (nSheets > 0) log.AppendLine($"{nSheets} sheet(s) with the profile views.");
                     AbStore.Save(doc, map);
@@ -624,6 +647,15 @@ namespace ABBridgesRevit
                 UI.TaskDialog.Show("AB Bridges - error", ex.Message + "\n\n" + ex);
                 return UI.Result.Cancelled;
             }
+        }
+
+        // "* DENOTES JACKING END" value: the axis at the jacking end of the first / last stage, else the construction joint
+        private static string JackLabel(TendonGeo g, TendonSet set, TendonProfile p)
+        {
+            bool right = p.Data.TryGetValue("Jacking end (Left / Right)", out string je) && je.Trim().StartsWith("R", StringComparison.OrdinalIgnoreCase);
+            if (!right && p.Stage == 1 && g.AxisName.Count > 0) return "@" + g.AxisName[0];
+            if (right && p.Stage == set.Stages && g.AxisName.Count > 0) return "@" + g.AxisName[g.AxisName.Count - 1];
+            return "@CJ";
         }
 
         public static List<double> Offsets(TendonProfile p)
@@ -703,7 +735,7 @@ namespace ABBridgesRevit
             var st = g.Stations(set, p);
             var res = new List<(int, int)>();
             if (st.Count < 2) { res.Add((0, Math.Max(0, st.Count - 1))); return res; }
-            double L = st.Last().sta - st.First().sta, max = 0.60 * scale;
+            double L = st.Last().sta - st.First().sta, max = 0.53 * scale;     // ~80 m at 1:150: the view + the data table fit on A1
             int n = Math.Max(1, Math.Min(4, (int)Math.Ceiling(L / max - 1e-6)));
             int a = 0;
             for (int k = 1; k < n; k++)
@@ -717,7 +749,7 @@ namespace ABBridgesRevit
             return res;
         }
 
-        public static List<ElementId> Draw(Document doc, View v, TendonGeo g, TendonSet set, TendonProfile p, double vs, int ia, int ib, int part, int parts)
+        public static List<ElementId> Draw(Document doc, View v, TendonGeo g, TendonSet set, TendonProfile p, double vs, int ia, int ib, int part, int parts, FamilySymbol col = null)
         {
             var ids = new List<ElementId>();
             var all = g.Stations(set, p);
@@ -746,6 +778,11 @@ namespace ABBridgesRevit
             void Tx(XYZ at, string t, double rot = 0, HorizontalTextAlignment ha = HorizontalTextAlignment.Center)
             {
                 try { ids.Add(TextNote.Create(doc, v.Id, at, t, new TextNoteOptions(tt) { Rotation = rot, HorizontalAlignment = ha }).Id); } catch { }
+            }
+            void TxT(XYZ at, string t, double rot, ElementId type)
+            {
+                if (string.IsNullOrEmpty(t)) return;
+                try { ids.Add(TextNote.Create(doc, v.Id, at, t, new TextNoteOptions(type) { Rotation = rot, HorizontalAlignment = HorizontalTextAlignment.Center }).Id); } catch { }
             }
 
             // box: grey fill, outline, the section lines, the cells (dashed) between the diaphragms
@@ -811,7 +848,9 @@ namespace ABBridgesRevit
             double ys = -Ft(24 * paper);
             Ln(new XYZ(0, -ys, 0), new XYZ(Ft(s1 - s0), -ys, 0), thin);
             string jack = p.Data.TryGetValue("Jacking end (Left / Right)", out string je) && je.Trim().StartsWith("R", StringComparison.OrdinalIgnoreCase) ? "RIGHT" : "LEFT";
-            Tx(new XYZ(Ft((s1 - s0) / 2), -ys + Ft(3 * paper), 0), $"CONSTRUCTION STAGE {p.Stage}\n{total * 1000:0} ({jack} END JACKING)");
+            Ln(new XYZ(0, -ys, 0) + new XYZ(-Ft(paper), -Ft(paper), 0), new XYZ(0, -ys, 0) + new XYZ(Ft(paper), Ft(paper), 0), thin);
+            Ln(new XYZ(Ft(s1 - s0), -ys, 0) + new XYZ(-Ft(paper), -Ft(paper), 0), new XYZ(Ft(s1 - s0), -ys, 0) + new XYZ(Ft(paper), Ft(paper), 0), thin);
+            Tx(new XYZ(Ft((s1 - s0) / 2), -ys + Ft(3 * paper), 0), $"CONSTRUCTION STAGE -{p.Stage}\n{total * 1000:0} ({jack} END JACKING)");
 
             // the tendon: one smooth curve through the points, * at the jacking end
             var cp = st.Select(q => P(q.sta, double.IsNaN(q.y) ? depth / 2 : q.y)).ToList();
@@ -835,22 +874,61 @@ namespace ABBridgesRevit
             Tx((d0 + d1) / 2 + new XYZ(Ft(2.5 * paper), 0, 0), (depth * 1000).ToString("0", CI), Math.PI / 2);
 
             // the table: DISTANCE ALONG C/L / DISTANCE FROM TOP OF BOX TO TENDONS CG (mm)
-            double cw = Ft(9 * paper), rh = Ft(14 * paper), x0 = 0, y0 = P(s0, depth).Y - Ft(18 * paper);
-            double hw = Ft(48 * paper);
+            // rows as tall as the longest text (+ margin) so no text goes over the lines; the text sits in the middle of its cell
+            const double TextMm = 2.0;
+            ElementId tt2 = TextType(doc, TextMm);
             int n = st.Count;
-            var head = new[] { "DISTANCE ALONG C/L", "DISTANCE FROM TOP OF BOX\nTO TENDONS CG IN (mm)" };
-            for (int k = 0; k <= 2; k++) Ln(new XYZ(x0 - hw, y0 - k * rh, 0), new XYZ(x0 + n * cw, y0 - k * rh, 0), thin);
-            Ln(new XYZ(x0 - hw, y0, 0), new XYZ(x0 - hw, y0 - 2 * rh, 0), thin);
-            for (int k = 0; k <= n; k++) Ln(new XYZ(x0 + k * cw, y0, 0), new XYZ(x0 + k * cw, y0 - 2 * rh, 0), thin);
-            Tx(new XYZ(x0 - hw / 2, y0 - rh / 2, 0), head[0]);
-            Tx(new XYZ(x0 - hw / 2, y0 - 1.5 * rh, 0), head[1]);
+            string[] labs = new string[n], vals = new string[n];
             for (int k = 0; k < n; k++)
             {
-                double xc = x0 + (k + 0.5) * cw;
-                string lab = TendonGeo.IsAnchor(st[k].x) ? (st[k].x.EndsWith("2") ? "Anc.2" : "Anc.1") : st[k].x;
-                Tx(new XYZ(xc, y0 - rh / 2, 0), lab, Math.PI / 2);
-                Tx(new XYZ(xc, y0 - 1.5 * rh, 0), double.IsNaN(st[k].y) ? "" : (st[k].y * 1000).ToString("0", CI), Math.PI / 2);
+                labs[k] = TendonGeo.IsAnchor(st[k].x) ? (st[k].x.EndsWith("2") ? "Anc.2" : "Anc.1") : st[k].x;
+                vals[k] = double.IsNaN(st[k].y) ? "" : (st[k].y * 1000).ToString("0", CI);
             }
+            double charMm = TextMm * 0.8;                                        // width of one character (Arial ~0.8 x height, kept generous)
+            double rh1 = Ft(Math.Max(12, labs.Max(x => x.Length) * charMm + 4) * paper);
+            double rh2 = Ft(Math.Max(12, vals.Max(x => x.Length) * charMm + 4) * paper);
+            double cw = Ft(Math.Max(8, TextMm * 2 + 4) * paper), x0 = 0, y0 = P(s0, depth).Y - Ft(18 * paper);
+            double hw = Ft(50 * paper);
+            var head = new[] { "DISTANCE ALONG C/L", "DISTANCE FROM TOP OF BOX\nTO TENDONS CG IN (mm)" };
+            // head cells (lines + text)
+            Ln(new XYZ(x0 - hw, y0, 0), new XYZ(x0, y0, 0), thin);
+            Ln(new XYZ(x0 - hw, y0 - rh1, 0), new XYZ(x0, y0 - rh1, 0), thin);
+            Ln(new XYZ(x0 - hw, y0 - rh1 - rh2, 0), new XYZ(x0, y0 - rh1 - rh2, 0), thin);
+            Ln(new XYZ(x0 - hw, y0, 0), new XYZ(x0 - hw, y0 - rh1 - rh2, 0), thin);
+            TxT(new XYZ(x0 - hw / 2, y0 - rh1 / 2 + Ft(TextMm / 2 * paper), 0), head[0], 0, tt2);
+            TxT(new XYZ(x0 - hw / 2, y0 - rh1 - rh2 / 2 + Ft(TextMm * paper), 0), head[1], 0, tt2);
+            if (col != null)
+            {
+                // the 2D family: one column per point (X Label / Y Value), placed side by side
+                try
+                {
+                    if (!col.IsActive) col.Activate();
+                    SetLen(col, "Row 1 H", rh1); SetLen(col, "Row 2 H", rh2);
+                    for (int k = 0; k < n; k++)
+                    {
+                        FamilyInstance fi = doc.Create.NewFamilyInstance(new XYZ(x0 + k * cw, y0, 0), col, v);
+                        SetText(fi, "X Label", labs[k]); SetText(fi, "Y Value", vals[k]); SetLen(fi, "Width", cw);
+                        ids.Add(fi.Id);
+                    }
+                    Ln(new XYZ(x0 + n * cw, y0, 0), new XYZ(x0 + n * cw, y0 - rh1 - rh2, 0), thin);
+                }
+                catch { col = null; }
+            }
+            if (col == null)
+            {
+                // lines + text notes
+                foreach (double yy in new[] { y0, y0 - rh1, y0 - rh1 - rh2 }) Ln(new XYZ(x0, yy, 0), new XYZ(x0 + n * cw, yy, 0), thin);
+                for (int k = 0; k <= n; k++) Ln(new XYZ(x0 + k * cw, y0, 0), new XYZ(x0 + k * cw, y0 - rh1 - rh2, 0), thin);
+                // a note turned 90° hangs to the right of its point by its height: move it left by half the text height
+                double half = Ft(TextMm / 2 * paper);
+                for (int k = 0; k < n; k++)
+                {
+                    double xc = x0 + (k + 0.5) * cw - half;
+                    TxT(new XYZ(xc, y0 - rh1 / 2, 0), labs[k], Math.PI / 2, tt2);
+                    TxT(new XYZ(xc, y0 - rh1 - rh2 / 2, 0), vals[k], Math.PI / 2, tt2);
+                }
+            }
+            double rh = (rh1 + rh2) / 2;                                          // used below (2 * rh = table height)
 
             // a cut part: the break line and FOR CONTINUATION, SEE BELOW / ABOVE
             double yTop = Ft(36 * paper), yBot = y0 - 2 * rh;
@@ -858,32 +936,32 @@ namespace ABBridgesRevit
             {
                 double xb = Ft(s1 - s0) + Ft(12 * paper);
                 Ln(new XYZ(xb, yTop, 0), new XYZ(xb, yBot, 0), dash);
-                Tx(new XYZ(xb + Ft(5 * paper), (yTop + yBot) / 2, 0), "FOR CONTINUATION, SEE BELOW", Math.PI / 2);
+                Tx(new XYZ(xb + Ft(5 * paper), (yTop + yBot) / 2, 0), "FOR CONTINUATION, SEE NEXT SHEET", Math.PI / 2);
             }
             if (!first)
             {
                 double xb = x0 - hw - Ft(4 * paper);
                 Ln(new XYZ(xb, yTop, 0), new XYZ(xb, yBot, 0), dash);
-                Tx(new XYZ(xb - Ft(5 * paper), (yTop + yBot) / 2, 0), "FOR CONTINUATION, SEE ABOVE", Math.PI / 2);
+                Tx(new XYZ(xb - Ft(5 * paper), (yTop + yBot) / 2, 0), "FOR CONTINUATION, SEE PREVIOUS SHEET", Math.PI / 2);
             }
 
             // title under the view (underlined) and the scale
             double tyl = y0 - 2 * rh - Ft(12 * paper), xm = Ft((s1 - s0) / 2);
-            Tx(new XYZ(xm, tyl, 0), $"WEB POST TENSIONING TENDON PROFILE - PATH {p.Path} - STAGE {p.Stage}" + (parts > 1 ? $" (PART {part} OF {parts})" : ""));
+            Tx(new XYZ(xm, tyl, 0), $"WEB POST TENSIONING TENDON PROFILE FOR TENDON PATH {p.Path} - STAGE {p.Stage}" + (parts > 1 ? $" (PART {part} OF {parts})" : ""));
             Ln(new XYZ(xm - Ft(60 * paper), tyl - Ft(4.5 * paper), 0), new XYZ(xm + Ft(60 * paper), tyl - Ft(4.5 * paper), 0), thin);
             Tx(new XYZ(xm - Ft(60 * paper), tyl - Ft(7.5 * paper), 0), "1 : " + v.Scale, 0, HorizontalTextAlignment.Left);
             return ids;
         }
 
         // the data table, drawn on the sheet (paper = metres per sheet mm)
-        public static List<ElementId> Data(Document doc, View v, XYZ at, double paper, TendonProfile p)
+        public static List<ElementId> Data(Document doc, View v, XYZ at, double paper, TendonProfile p, string jack = "@CJ")
         {
             var ids = new List<ElementId>();
             ElementId tt = doc.GetDefaultElementTypeId(ElementTypeGroup.TextNoteType);
             GraphicsStyle thin = SubstructureCommand.LineStyle(doc, "AB Tendon Thin", new RColor(0, 0, 0));
             void Ln(XYZ a, XYZ b) { try { DetailCurve dc = doc.Create.NewDetailCurve(v, Line.CreateBound(a, b)); if (thin != null) dc.LineStyle = thin; ids.Add(dc.Id); } catch { } }
             void Tx(XYZ q, string t) { try { ids.Add(TextNote.Create(doc, v.Id, q, t, new TextNoteOptions(tt) { HorizontalAlignment = HorizontalTextAlignment.Center }).Id); } catch { } }
-            double tw = Ft(70 * paper), tv = Ft(18 * paper), trh = Ft(8 * paper);
+            double tw = Ft(72 * paper), tv = Ft(20 * paper), trh = Ft(7 * paper);
             string[] keys = { "Total jacking force PJ (kN)", "No. of tendons per web", "No. of strands per tendon", "Area of strand (mm2)", "No. of webs" };
             int n = keys.Length + 1;
             for (int k = 0; k <= n; k++) Ln(new XYZ(at.X, at.Y - k * trh, 0), new XYZ(at.X + tw + tv, at.Y - k * trh, 0));
@@ -894,7 +972,7 @@ namespace ABBridgesRevit
                 Tx(new XYZ(at.X + tw + tv / 2, at.Y - (k + 0.35) * trh, 0), p.Data.TryGetValue(keys[k], out string kv) ? kv : "");
             }
             Tx(new XYZ(at.X + tw / 2, at.Y - (keys.Length + 0.35) * trh, 0), "* DENOTES JACKING END");
-            Tx(new XYZ(at.X + tw + tv / 2, at.Y - (keys.Length + 0.35) * trh, 0), "@CJ");
+            Tx(new XYZ(at.X + tw + tv / 2, at.Y - (keys.Length + 0.35) * trh, 0), jack);
             return ids;
         }
 
@@ -908,6 +986,44 @@ namespace ABBridgesRevit
             try { ids.Add(TextNote.Create(doc, v.Id, at, Ft(0.20), t, new TextNoteOptions(tt) { HorizontalAlignment = HorizontalTextAlignment.Left }).Id); } catch { }
             return ids;
         }
+
+        // the 2D table column family (Families\AB Tendon Table Column.rfa next to the add-in); null = draw with lines + text
+        public static FamilySymbol TableFamily(Document doc, StringBuilder log)
+        {
+            const string Name = "AB Tendon Table Column";
+            Family f = new FilteredElementCollector(doc).OfClass(typeof(Family)).Cast<Family>().FirstOrDefault(x => x.Name == Name);
+            if (f == null)
+            {
+                string dir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? "";
+                string file = new[] { Path.Combine(dir, "Families", Name + ".rfa"), Path.Combine(dir, Name + ".rfa") }.FirstOrDefault(File.Exists);
+                if (file == null) return null;
+                try { doc.LoadFamily(file, out f); } catch (Exception e) { log.AppendLine("Table family not loaded: " + e.Message); return null; }
+            }
+            return f == null ? null : f.GetFamilySymbolIds().Select(id => doc.GetElement(id) as FamilySymbol).FirstOrDefault(x => x != null);
+        }
+
+        // text type "AB Tendon 2 mm": known size, so the table cells can be sized to the text
+        private static ElementId TextType(Document doc, double mm)
+        {
+            string name = $"AB Tendon {mm.ToString("0.#", CI)} mm";
+            TextNoteType ex = new FilteredElementCollector(doc).OfClass(typeof(TextNoteType)).Cast<TextNoteType>().FirstOrDefault(x => x.Name == name);
+            if (ex != null) return ex.Id;
+            ElementId def = doc.GetDefaultElementTypeId(ElementTypeGroup.TextNoteType);
+            try
+            {
+                TextNoteType t = (doc.GetElement(def) as TextNoteType)?.Duplicate(name) as TextNoteType;
+                if (t == null) return def;
+                t.get_Parameter(BuiltInParameter.TEXT_SIZE)?.Set(UnitUtils.ConvertToInternalUnits(mm, UnitTypeId.Millimeters));
+                t.get_Parameter(BuiltInParameter.TEXT_FONT)?.Set("Arial");
+                t.get_Parameter(BuiltInParameter.TEXT_BACKGROUND)?.Set(1);
+                t.get_Parameter(BuiltInParameter.TEXT_BOX_VISIBILITY)?.Set(0);
+                return t.Id;
+            }
+            catch { return def; }
+        }
+
+        private static void SetLen(Element e, string name, double v) { try { Parameter p = e.LookupParameter(name); if (p != null && !p.IsReadOnly) p.Set(v); } catch { } }
+        private static void SetText(Element e, string name, string v) { try { Parameter p = e.LookupParameter(name); if (p != null && !p.IsReadOnly) p.Set(v ?? ""); } catch { } }
 
         private static double Num(TendonProfile p, string key, double def) =>
             p.Data.TryGetValue(key, out string s) && double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out double v) && v > 0 ? v : def;

@@ -20,3 +20,10 @@ SubstructureForm: fixed `else` without `if` in Shown, Relayout/LayoutParams now 
 - Logo in the Excel: `XlsxLogo.Stamp` adds the picture to the title row after `XlsxBook.Write`.
 - Check on the laptop: XStyle has `BorderColor`, `Indent`, `Size`; how `ThickLeft` uses `BorderColor`; Revit `XlsxPatch`
   keeps the drawings when it rewrites Parameters.
+
+## Tendon sheets (Nov 25, like the 2 photos)
+- One sheet per stage `AB-TP-ss` (more parts -> `AB-TP-ss-k`): path 1 over path 2, data table at the right of each view,
+  notes bottom left. Title "...FOR TENDON PATH p - STAGE s", "CONSTRUCTION STAGE -s" dim with ticks.
+- Distance table: rows sized to the longest text, rotated text moved by half its height (was over the lines).
+- 2D family `ABBridgesRevit\Families\AB Tendon Table Column.rfa` (build by hand, see the .md there); copy the Families
+  folder next to the add-in DLL / into the installer. Without it: lines + text.
