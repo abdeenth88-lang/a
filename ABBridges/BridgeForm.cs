@@ -93,7 +93,6 @@ namespace ABBridges
             _tabs.Selecting += OnTabSelecting;
             _tabs.SelectedIndexChanged += (s, e) => { UpdateButtons(); _nav.SetActive(_tabs.SelectedIndex); SnapLater(); };
 
-            var head = new BrandHeader("for Civil 3D");
             Brand.SetIcon(this);
             _nav = new NavBar(PageNames);
             _nav.PageClicked += i => _tabs.SelectedIndex = i;
@@ -116,7 +115,6 @@ namespace ABBridges
             Controls.Add(_tabs);
             Controls.Add(foot);
             Controls.Add(_nav);
-            Controls.Add(head);
             CancelButton = _bClose;
 
             BuildSetup();

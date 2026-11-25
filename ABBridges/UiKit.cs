@@ -53,7 +53,7 @@ namespace ABBridges
         public const string Email = "Abdeenth88@gmail.com";
         public const string Version = "2025.11";
 
-        private static Stream Res(string file)
+        internal static Stream Res(string file)
         {
             var asm = System.Reflection.Assembly.GetExecutingAssembly();
             string name = asm.GetManifestResourceNames().FirstOrDefault(n => n.EndsWith(file, StringComparison.OrdinalIgnoreCase));
@@ -79,6 +79,12 @@ namespace ABBridges
                     }
                 }
             }
+            catch { return null; }
+        }
+
+        public static byte[] LogoBytes()
+        {
+            try { using (Stream s = Res("AB_logo_256.png")) { if (s == null) return null; var m = new MemoryStream(); s.CopyTo(m); return m.ToArray(); } }
             catch { return null; }
         }
 
@@ -109,52 +115,102 @@ namespace ABBridges
         }
     }
 
-    // numbered page buttons: active = accent, others grey
+    // page chip inside the navy header (6D): outlined, the open one white with an orange number
+    internal sealed class Chip : Control
+    {
+        public string Number = "", Label = "";
+        public bool Active;
+        private static readonly Color Line = Color.FromArgb(79, 106, 140), Soft = Color.FromArgb(175, 192, 214);
+
+        public Chip()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor, true);
+            Cursor = Cursors.Hand;
+            Font = new Font("Segoe UI Semibold", 9.5f);
+            Height = 30;
+        }
+
+        public int Preferred()
+        {
+            int w1 = Number.Length == 0 ? 0 : TextRenderer.MeasureText(Number, Font).Width;
+            return w1 + TextRenderer.MeasureText(Label, Font).Width + 20;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(Theme.Navy);
+            var r = new Rectangle(0, 0, Width - 1, Height - 1);
+            using (GraphicsPath p = Round(r, 5))
+            {
+                if (Active) using (var b = new SolidBrush(Color.White)) g.FillPath(b, p);
+                using (var pen = new Pen(Active ? Color.White : Line)) g.DrawPath(pen, p);
+            }
+            int x = 9;
+            if (Number.Length > 0)
+            {
+                Size n = TextRenderer.MeasureText(Number, Font);
+                TextRenderer.DrawText(g, Number, Font, new Rectangle(x, 0, n.Width, Height), Active ? Theme.Accent : Soft, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                x += n.Width + 2;
+            }
+            TextRenderer.DrawText(g, Label, Font, new Rectangle(x, 0, Width - x, Height), Active ? Theme.Navy : Soft, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
+
+        private static GraphicsPath Round(Rectangle r, int rad)
+        {
+            var p = new GraphicsPath();
+            int d = rad * 2;
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+    }
+
+    // navy header with the logo, the numbered page chips and "Created by ..." (pages live in the header to save room)
     internal sealed class NavBar : Panel
     {
-        private readonly List<Button> _b = new List<Button>();
+        private readonly List<Chip> _b = new List<Chip>();
+        private readonly Label _by;
+        private readonly Label _title;
         public event Action<int> PageClicked;
 
         public NavBar(params string[] pages)
         {
             Dock = DockStyle.Top;
-            Height = 46;
-            BackColor = Color.White;
-            Padding = new Padding(8, 7, 8, 7);
+            Height = 48;
+            BackColor = Theme.Navy;
+            Controls.Add(new PictureBox { Image = Brand.Logo(28), Size = new Size(28, 28), Location = new Point(10, 10), SizeMode = PictureBoxSizeMode.Zoom });
+            _title = new Label { Text = "AB Bridges", ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(44, 13) };
+            Controls.Add(_title);
             for (int i = 0; i < pages.Length; i++)
             {
                 int k = i;
-                var b = new Button
-                {
-                    Text = (i + 1) + "  " + pages[i],
-                    FlatStyle = FlatStyle.Flat,
-                    Font = Theme.Bold,
-                    Cursor = Cursors.Hand,
-                    TabStop = false
-                };
-                b.FlatAppearance.BorderSize = 0;
-                b.Click += (s, e) => PageClicked?.Invoke(k);
-                _b.Add(b);
-                Controls.Add(b);
+                var c = new Chip { Number = (i + 1).ToString(), Label = pages[i] };
+                c.Click += (s, e) => PageClicked?.Invoke(k);
+                _b.Add(c);
+                Controls.Add(c);
             }
+            _by = new Label { Text = "Created by " + Brand.Author, ForeColor = Color.FromArgb(143, 163, 189), Font = new Font("Segoe UI", 8.5f), AutoSize = true };
+            Controls.Add(_by);
             Resize += (s, e) => Lay();
             Lay();
         }
 
         private void Lay()
         {
-            int n = _b.Count, gap = 6, w = Math.Max(60, (ClientSize.Width - Padding.Horizontal - gap * (n - 1)) / Math.Max(1, n));
-            for (int i = 0; i < n; i++) _b[i].SetBounds(Padding.Left + i * (w + gap), Padding.Top, w, Height - Padding.Vertical);
+            int x = _title.Right + 18;
+            foreach (Chip c in _b) { c.SetBounds(x, 9, c.Preferred(), 30); x += c.Width + 6; }
+            _by.Location = new Point(Width - _by.PreferredWidth - 12, (Height - _by.PreferredHeight) / 2);
+            _by.Visible = _by.Left > x + 10;            // hidden when the window is too narrow
         }
 
         public void SetActive(int index)
         {
-            for (int i = 0; i < _b.Count; i++)
-            {
-                bool on = i == index;
-                _b[i].BackColor = on ? Theme.Accent : Theme.Idle;
-                _b[i].ForeColor = on ? Color.White : Theme.IdleText;
-            }
+            for (int i = 0; i < _b.Count; i++) { _b[i].Active = i == index; _b[i].Invalidate(); }
         }
     }
 

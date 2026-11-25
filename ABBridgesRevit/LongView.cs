@@ -31,12 +31,30 @@ namespace ABBridgesRevit
             tc.ItemSize = new Size(96, 28);
             tc.DrawItem += (s, e) =>
             {
+                // chips (6D): the open axis navy with an orange number, the others outlined
                 bool on = e.Index == tc.SelectedIndex;
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
                 Rectangle r = tc.GetTabRect(e.Index);
+                using (var bg = new SolidBrush(tc.Parent?.BackColor ?? Color.White)) g.FillRectangle(bg, r);
                 r.Inflate(-2, -2);
-                using (var b = new SolidBrush(on ? Accent : Idle)) e.Graphics.FillRectangle(b, r);
-                TextRenderer.DrawText(e.Graphics, (e.Index + 1) + "  " + tc.TabPages[e.Index].Text, new Font("Segoe UI Semibold", 9f), r,
-                                      on ? Color.White : IdleText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                using (var p = new GraphicsPath())
+                {
+                    int d = 8;
+                    p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+                    p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); p.AddArc(r.X, r.Bottom - d, d, d, 90, 90); p.CloseFigure();
+                    using (var b = new SolidBrush(on ? Navy : Color.White)) g.FillPath(b, p);
+                    using (var pen = new Pen(on ? Navy : Color.FromArgb(207, 213, 221))) g.DrawPath(pen, p);
+                }
+                using (var f = new Font("Segoe UI Semibold", 9f))
+                {
+                    string num = (e.Index + 1).ToString(), txt = tc.TabPages[e.Index].Text;
+                    int wn = TextRenderer.MeasureText(num, f).Width, wt = TextRenderer.MeasureText(txt, f).Width;
+                    int x = r.X + Math.Max(6, (r.Width - wn - wt - 4) / 2);
+                    TextRenderer.DrawText(g, num, f, new Rectangle(x, r.Y, wn, r.Height), on ? Accent : IdleText, TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                    TextRenderer.DrawText(g, txt, f, new Rectangle(x + wn + 4, r.Y, r.Right - x - wn - 4, r.Height), on ? Color.White : IdleText,
+                                          TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+                }
             };
         }
 

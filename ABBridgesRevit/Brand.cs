@@ -76,12 +76,14 @@ namespace ABBridgesRevit
             BackColor = Brand.Navy;
             var pic = new PictureBox { Image = Brand.Logo(30), Size = new Size(30, 30), Location = new Point(10, 8), SizeMode = PictureBoxSizeMode.Zoom };
             var title = new Label { Text = "AB Bridges", ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 12f), AutoSize = true, Location = new Point(48, 11) };
-            var sub = new Label { Text = page, ForeColor = Color.FromArgb(175, 192, 214), Font = new Font("Segoe UI", 9f), AutoSize = true, Location = new Point(150, 16) };
+            // the page name as a white chip (same look as the Civil 3D page chips)
+            var sub = new Label { Text = page, ForeColor = Brand.Navy, BackColor = Color.White, Font = new Font("Segoe UI Semibold", 9.5f), AutoSize = true,
+                                  Padding = new Padding(9, 5, 9, 5), Location = new Point(150, 9) };
             var by = new Label { Text = "Created by " + Brand.Author, ForeColor = Color.FromArgb(143, 163, 189), Font = new Font("Segoe UI", 8.5f), AutoSize = true, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             Controls.AddRange(new Control[] { pic, title, sub, by });
             Layout += (s, e) =>
             {
-                sub.Left = title.Right + 6;
+                sub.Left = title.Right + 18;
                 by.Location = new Point(Width - by.PreferredWidth - 12, (Height - by.PreferredHeight) / 2);
             };
         }

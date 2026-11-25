@@ -40,6 +40,34 @@ namespace ABBridges
         private const string Navy = "1F3A5F";
         private const string Ink = "1F2937";
         private const string Purple = "5B21B6";
+        private const string Green = "2E7D5B", Orange = "C25E1B";
+        private const string Line = "000000", Soft = "A6A6A6";       // table lines: black for headers / strong rows, grey for the rest
+        // group colours: the light fill of the group row (old look) -> strong fill of the group title
+        private static readonly Dictionary<string, string> Strong = new Dictionary<string, string>
+        {
+            ["DCE6F1"] = Navy, ["EDE7F6"] = Navy, ["E2EFDA"] = Green, ["D9F2E3"] = Green, ["FCE4D6"] = Orange, ["E9DFFB"] = Purple
+        };
+        private static readonly Dictionary<string, string> Light = new Dictionary<string, string>
+        {
+            [Navy] = "DCE3EC", [Green] = "D7ECE2", [Orange] = "F7DFCF", [Purple] = "E9DFFB"
+        };
+        // colour bar left of the Type cell
+        private static string Tag(SectionKind k)
+        {
+            switch (k)
+            {
+                case SectionKind.Axis: return Navy;
+                case SectionKind.DiaphragmFace: return "7A8CA5";
+                case SectionKind.Corbel: return Green;
+                case SectionKind.ConstructionJoint: return "E8792B";
+                case SectionKind.NearDiaphragm: return "B5BFCC";
+                case SectionKind.InternalDiaphragm: return "7C5CC4";
+                default: return null;
+            }
+        }
+        // light tint of the left / right edge columns (stronger on an axis row)
+        private static string Tint(bool left, bool axis) => left ? (axis ? "E3F1EA" : "F6FBF8") : (axis ? "FBE8DB" : "FFF9F4");
+        private static readonly Dictionary<XSheet, int> LogoAt = new Dictionary<XSheet, int>();   // sheet -> last column of its title (logo)
 
         private static XStyle St(string fill = null, bool bold = false, string color = Ink, string align = null,
                                  string fmt = null, bool thickLeft = false, double size = 11)
@@ -47,14 +75,15 @@ namespace ABBridges
 
         public static void Write(string path, ReportData d)
         {
+            LogoAt.Clear();
             var sheets = new List<XSheet>
             {
                 SuperStructure(d),
                 Profile(d),
                 Substructure(d),
-                Parameters(d),
-                InfoSheet(d)
+                Parameters(d)
             };
+            XSheet info = InfoSheet(d);
             // sheets made in Revit (Tendon Profile) are kept when the Excel is generated again
             XSheet keep = XlsxKeep.Read(path, "Tendon Profile");
             if (keep != null) sheets.Add(keep);
@@ -68,7 +97,12 @@ namespace ABBridges
                 toRevit.Widths[1] = 14;
             }
             sheets.Add(toRevit);
+            sheets.Add(info);                     // Info is always the last sheet
             XlsxBook.Write(path, sheets);
+            // the AB Bridges logo at the right end of every title (sheet index -> column)
+            var logo = new Dictionary<int, int>();
+            for (int i = 0; i < sheets.Count; i++) if (LogoAt.TryGetValue(sheets[i], out int c)) logo[i] = c;
+            try { XlsxLogo.Stamp(path, logo); } catch { }
         }
 
         // ---------------------------------------------------------------- common blocks
@@ -87,13 +121,14 @@ namespace ABBridges
         // title row + info block; returns the first free row (group row)
         private static int Head(XSheet sh, string title, int ncols, List<(string, string)> info)
         {
-            sh.Merge(1, 1, 1, ncols, title, new XStyle { Fill = Navy, Bold = true, Color = "FFFFFF", Size = 16, VCenter = true, Indent = 1 });
-            sh.Heights[1] = 30;
+            sh.Merge(1, 1, 1, ncols, title, new XStyle { Fill = Navy, Bold = true, Color = "FFFFFF", Size = 16, VCenter = true, Indent = 1, BorderColor = Line });
+            sh.Heights[1] = 34;
+            LogoAt[sh] = ncols;
             int r = 2;
             foreach (var (k, v) in info)
             {
-                sh.Merge(r, 1, r, 2, k, St(null, true, Navy));
-                sh.Merge(r, 3, r, Math.Min(ncols, 10), v, St());
+                sh.Merge(r, 1, r, 2, k, new XStyle { Fill = "F4F6F9", Color = "787E88", Size = 10, BorderColor = Line });
+                sh.Merge(r, 3, r, Math.Min(ncols, 10), v, new XStyle { Fill = "F4F6F9", Bold = true, Color = Navy, BorderColor = Line });
                 r++;
             }
             return r + 1;
@@ -115,9 +150,11 @@ namespace ABBridges
             foreach (Grp gr in groups)
             {
                 starts.Add(c);
-                sh.Merge(g, c, g, c + gr.Cols.Length - 1, gr.Title, new XStyle { Fill = gr.Fill, Bold = true, Color = Navy, HAlign = "center" });
+                string strong = Strong.TryGetValue(gr.Fill ?? "", out string sf) ? sf : (gr.Fill ?? Navy);
+                string light = Light.TryGetValue(strong, out string lf) ? lf : "EEF2F7";
+                sh.Merge(g, c, g, c + gr.Cols.Length - 1, gr.Title, new XStyle { Fill = strong, Bold = true, Color = "FFFFFF", HAlign = "center", BorderColor = Line });
                 for (int j = 0; j < gr.Cols.Length; j++)
-                    sh.Set(g + 1, c + j, gr.Cols[j], new XStyle { Fill = Navy, Bold = true, Color = "FFFFFF", HAlign = "center", VCenter = true });
+                    sh.Set(g + 1, c + j, gr.Cols[j], new XStyle { Fill = light, Bold = true, Color = Navy, HAlign = "center", VCenter = true, BorderColor = Line });
                 c += gr.Cols.Length;
             }
             sh.Heights[g + 1] = 22;
@@ -126,19 +163,17 @@ namespace ABBridges
 
         private static (string fill, bool bold) RowFill(Section s, int i)
         {
+            // white rows; an axis is light grey and bold, a construction joint bold (orange text)
             switch (s.Kind)
             {
-                case SectionKind.Axis: return ("FFF2A8", true);
-                case SectionKind.DiaphragmFace: return ("FDE9D9", false);
-                case SectionKind.Corbel: return ("D9F2E3", false);
-                case SectionKind.ConstructionJoint: return ("E9DFFB", true);
-                case SectionKind.NearDiaphragm: return ("EEF2F7", false);
-                default: return (i % 2 == 0 ? "FFFFFF" : "F7F9FC", false);
+                case SectionKind.Axis: return ("EEF2F7", true);
+                case SectionKind.ConstructionJoint: return ("FFFFFF", true);
+                default: return ("FFFFFF", false);
             }
         }
 
         // writes one value with the row style; numbers get 3 decimals
-        private static void Put(XSheet sh, int r, int c, object v, string fill, bool bold, bool thickLeft, bool center, string color = Ink, string fmt = "0.000")
+        private static void Put(XSheet sh, int r, int c, object v, string fill, bool bold, bool thickLeft, bool center, string color = Ink, string fmt = "0.000", string border = null)
         {
             bool num = v is double || v is XFormula;
             var st = new XStyle
@@ -148,7 +183,8 @@ namespace ABBridges
                 Color = color,
                 ThickLeft = thickLeft,
                 NumFmt = (v is double || v is XFormula) ? fmt : null,
-                HAlign = num ? "right" : (center ? "center" : null)
+                HAlign = num ? "right" : (center ? "center" : null),
+                BorderColor = border ?? (bold ? Line : Soft)
             };
             sh.Set(r, c, v, st);
         }
@@ -172,7 +208,7 @@ namespace ABBridges
             {
                 Section s = d.Sections[i];
                 var (fill, bold) = RowFill(s, i);
-                string col = s.Kind == SectionKind.ConstructionJoint ? Purple : Ink;
+                string col = s.Kind == SectionKind.ConstructionJoint ? Orange : Ink;
                 object[] vals =
                 {
                     (double)(i + 1), s.Remark, s.TypeName, Fmt.Chainage(s.Station), s.Station, s.SkewDeg,
@@ -185,7 +221,9 @@ namespace ABBridges
                     int c = j + 1;
                     object v = vals[j];
                     string fmt = c == 1 ? "0" : "0.000";
-                    Put(sh, r, c, v, fill, bold, starts.Contains(c), c == 3 || c == 4 || c == 10 || c == 14, col, fmt);
+                    string f = c >= 7 && c <= 10 ? Tint(true, s.Kind == SectionKind.Axis) : c >= 11 && c <= 14 ? Tint(false, s.Kind == SectionKind.Axis) : fill;
+                    string tag = c == 3 ? Tag(s.Kind) : null;
+                    Put(sh, r, c, v, f, bold, starts.Contains(c) || tag != null, c == 3 || c == 4 || c == 10 || c == 14, col, fmt, tag);
                 }
             }
             Widths(sh, 5, 17, 18, 11, 10, 9, 13, 13, 9, 26, 13, 13, 9, 26, 8);
@@ -226,7 +264,7 @@ namespace ABBridges
             {
                 Section s = d.Sections[i];
                 var (fill, bold) = RowFill(s, i);
-                string col = s.Kind == SectionKind.ConstructionJoint ? Purple : Ink;
+                string col = s.Kind == SectionKind.ConstructionJoint ? Orange : Ink;
                 double h = double.IsNaN(s.CenterZ) || double.IsNaN(s.NglZ) ? double.NaN : s.CenterZ - s.NglZ;
                 object[] vals =
                 {
@@ -236,7 +274,9 @@ namespace ABBridges
                 for (int j = 0; j < vals.Length; j++)
                 {
                     int c = j + 1;
-                    Put(sh, r, c, vals[j], fill, bold, starts.Contains(c), c == 3 || c == 4 || c == 9, col, c == 1 ? "0" : "0.000");
+                    string f = c == 8 || c == 9 ? Tint(true, s.Kind == SectionKind.Axis) : c == 10 ? Tint(false, s.Kind == SectionKind.Axis) : fill;
+                    string tag = c == 3 ? Tag(s.Kind) : null;
+                    Put(sh, r, c, vals[j], f, bold, starts.Contains(c) || tag != null, c == 3 || c == 4 || c == 9, col, c == 1 ? "0" : "0.000", tag);
                 }
             }
 
@@ -335,10 +375,13 @@ namespace ABBridges
             {
                 Section s = secs[i];
                 var (fill, bold) = RowFill(s, i);
-                string col = s.Kind == SectionKind.ConstructionJoint ? Purple : Ink;
+                string col = s.Kind == SectionKind.ConstructionJoint ? Orange : Ink;
                 object[] vals = { (double)(i + 1), s.Remark, s.TypeName, Fmt.Chainage(s.Station), s.Station };
                 for (int j = 0; j < vals.Length; j++)
-                    Put(sh, r, j + 1, vals[j], fill, bold, j == 0, j == 2 || j == 3, col, j == 0 ? "0" : "0.000");
+                {
+                    string tag = j == 2 ? Tag(s.Kind) : null;
+                    Put(sh, r, j + 1, vals[j], fill, bold, j == 0 || tag != null, j == 2 || j == 3, col, j == 0 ? "0" : "0.000", tag);
+                }
 
                 Put(sh, r, 6, (double)(i + 1), "FFFFFF", false, true, true, Ink, "0");
                 Put(sh, r, 7, null, "F2F7FF", false, false, false);
@@ -387,7 +430,7 @@ namespace ABBridges
             foreach (AxisSection a in d.AxisSections)
             {
                 sh.Merge(r, 1, r, 5, $"{a.Name}   ·   St {Fmt.Chainage(a.Station)}   ·   skew {a.SkewDeg.ToString("0.000", CI)}°",
-                         new XStyle { Fill = Navy, Bold = true, Color = "FFFFFF", Size = 12, Indent = 1 });
+                         new XStyle { Fill = Navy, Bold = true, Color = "FFFFFF", Size = 12, Indent = 1, BorderColor = Line });
                 r++;
                 (string, object)[] kv =
                 {
@@ -400,8 +443,8 @@ namespace ABBridges
                     Put(sh, r, 2, v, "FFFFFF", false, false, true, Ink, k.StartsWith("Dir") ? "0.000000" : "0.000");
                     r++;
                 }
-                r = PointBlock(sh, r, "DESIGN SURFACE", "DDEBF7", "0C447C", a.Design);
-                r = PointBlock(sh, r, "NGL", "E2EFDA", "27500A", a.Ngl);
+                r = PointBlock(sh, r, "DESIGN SURFACE", Navy, "FFFFFF", a.Design);
+                r = PointBlock(sh, r, "NGL", Green, "FFFFFF", a.Ngl);
                 r++;
             }
             Widths(sh, 16, 12, 14, 14, 10);
@@ -410,16 +453,17 @@ namespace ABBridges
 
         private static int PointBlock(XSheet sh, int r, string title, string fill, string color, List<(string name, double off, double x, double y, double z)> pts)
         {
-            sh.Merge(r, 1, r, 5, title, new XStyle { Fill = fill, Bold = true, Color = color });
+            sh.Merge(r, 1, r, 5, title, new XStyle { Fill = fill, Bold = true, Color = color, BorderColor = Line });
             r++;
             string[] h = { "Point", "Offset", "X", "Y", "Z" };
+            string light = Light.TryGetValue(fill, out string lf) ? lf : "EEF2F7";
             for (int j = 0; j < h.Length; j++)
-                sh.Set(r, j + 1, h[j], new XStyle { Fill = Navy, Bold = true, Color = "FFFFFF", HAlign = "center" });
+                sh.Set(r, j + 1, h[j], new XStyle { Fill = light, Bold = true, Color = Navy, HAlign = "center", BorderColor = Line });
             r++;
             for (int k = 0; k < pts.Count; k++, r++)
             {
                 var p = pts[k];
-                string fl = k % 2 == 0 ? "FFFFFF" : "F7F9FC";
+                string fl = "FFFFFF";
                 Put(sh, r, 1, p.name, fl, false, true, true);
                 Put(sh, r, 2, p.off, fl, false, false, false);
                 Put(sh, r, 3, p.x, fl, false, false, false);
@@ -470,9 +514,9 @@ namespace ABBridges
                     Put(sh, r, 3, cj.Factor, "FFFFFF", false, false, false);
                     Put(sh, r, 4, cj.Dist1, "FFFFFF", false, false, false);
                     Put(sh, r, 5, cj.Dist2, "FFFFFF", false, false, false);
-                    Put(sh, r, 6, Fmt.Chainage(s.CJ1), "FFFFFF", true, false, true, Purple);
-                    Put(sh, r, 7, Fmt.Chainage(s.CJ2), "FFFFFF", true, false, true, Purple);
-                    Put(sh, r, 8, Fmt.Chainage(s.CJ3), "FFFFFF", true, false, true, Purple);
+                    Put(sh, r, 6, Fmt.Chainage(s.CJ1), "FFFFFF", true, false, true, Orange);
+                    Put(sh, r, 7, Fmt.Chainage(s.CJ2), "FFFFFF", true, false, true, Orange);
+                    Put(sh, r, 8, Fmt.Chainage(s.CJ3), "FFFFFF", true, false, true, Orange);
                     r++;
                 }
             }
