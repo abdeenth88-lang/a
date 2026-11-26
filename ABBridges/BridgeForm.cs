@@ -1,4 +1,4 @@
-// AB Bridges - Extract Data dialog (WinForms, opened with Application.ShowModalDialog)
+﻿// AB Bridges - Extract Data dialog (WinForms, opened with Application.ShowModalDialog)
 // Tabs: Setup -> Construction Joint -> Under Bridge Cross -> Stations -> Generate Excel
 
 using System;
@@ -12,6 +12,7 @@ using System.Text;
 using System.Windows.Forms;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
+using Autodesk.AutoCAD.Geometry;
 using AcDocument = Autodesk.AutoCAD.ApplicationServices.Document;
 using CivSurface = Autodesk.Civil.DatabaseServices.Surface;
 
@@ -41,10 +42,10 @@ namespace ABBridges
         private TextBox _tbName, _tbStartSta, _tbCorbelStart, _tbCorbelEnd, _tbSpacing;
         private Label _lbDesign, _lbNgl, _lbUnder, _lbAlign, _lbCenter, _lbLeft, _lbRight, _lbAxes, _lbFile, _lbStatus;
         private Label _lbCjMode, _lbMinClr;
-        private DataGridView _gridAxes, _gridCj, _gridRoads, _gridPts, _gridSt;
+        private DataGridView _gridAxes, _gridCj, _gridRoads, _gridSt;
         private CheckBox _cbFeature, _cbReplace, _cbReverse;
         private NumericUpDown _nudSkew;
-        private Button _bPreview, _bNext, _bClose;
+        private NiceButton _bPreview, _bNext, _bClose;
 
         public BridgeForm(AcDocument doc)
         {
@@ -61,10 +62,14 @@ namespace ABBridges
 
         private NavBar _nav;
         private TabPage _tpId;
-        private PlanView _planSetup, _planId, _planSt;
+        private PlanView _planSetup, _planId, _planSt, _planCj;
+        private RoadsView _planRoads;
+        private List<(double sta, double z)> _deckProf = new List<(double, double)>(), _nglProf = new List<(double, double)>();
+        private SplitContainer _stSplit;
+        private NiceButton _bStList;
         private DataGridView _gridId;
         private CheckBox _cbIdAll;
-        private TextBox _tbNear;
+        private FlowLayoutPanel _nearBoxes;      // one box per distance (D1, D2, ...)
         private NumericUpDown _nudNear;
         private Label _lbEdges;
         private static readonly string[] PageNames = { "Setup", "Construction Joint", "Internal Diaphragm", "Roads Below", "Sections" };
@@ -91,7 +96,11 @@ namespace ABBridges
             foreach (TabPage tp in new[] { _tpSetup, _tpCj, _tpId, _tpCross, _tpSt }) { tp.BackColor = Theme.Page; tp.Padding = new Padding(8); }
             _tabs.TabPages.AddRange(new[] { _tpSetup, _tpCj, _tpId, _tpCross, _tpSt });
             _tabs.Selecting += OnTabSelecting;
-            _tabs.SelectedIndexChanged += (s, e) => { UpdateButtons(); _nav.SetActive(_tabs.SelectedIndex); SnapLater(); };
+            _tabs.SelectedIndexChanged += (s, e) =>
+            {
+                UpdateButtons(); _nav.SetActive(_tabs.SelectedIndex); SnapLater();
+                if (_tabs.SelectedTab == _tpSetup) RefreshSetupPlan();          // the span lengths typed on the other pages
+            };
 
             Brand.SetIcon(this);
             _nav = new NavBar(PageNames);
@@ -101,10 +110,9 @@ namespace ABBridges
             _lbStatus = new Label { Location = new Point(10, 13), Size = new Size(600, 22), ForeColor = Color.DimGray, AutoEllipsis = true, Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top };
             foot.Controls.Add(_lbStatus);
             _bPreview = Btn("Preview", 0, 9, (s, e) => DoPreview(), 90);
-            _bNext = Btn("Next →", 0, 9, (s, e) => DoNext(), 130);
+            _bNext = Btn("Next →", 0, 9, (s, e) => DoNext(), 130, Look.Primary);
             _bClose = Btn("Close", 0, 9, (s, e) => { DialogResult = DialogResult.Cancel; Close(); }, 88);
             _bClose.DialogResult = DialogResult.Cancel;
-            _bNext.BackColor = Theme.Navy; _bNext.ForeColor = Color.White; _bNext.FlatStyle = FlatStyle.Flat;
             foreach (Button b in new[] { _bPreview, _bNext, _bClose }) { b.Anchor = AnchorStyles.Top | AnchorStyles.Right; foot.Controls.Add(b); }
             foot.Resize += (s, e) =>
             {
@@ -126,11 +134,36 @@ namespace ABBridges
             UpdateButtons();
 
             Shown += (s, e) => SnapLater();
+            // Enter in a box = take the value (go to the next box); it never runs Generate Excel
+            KeyPreview = true;
+            KeyDown += (s, e) =>
+            {
+                if (e.KeyCode != Keys.Enter) return;
+                Control f = FindFocused(this);
+                if (f == null || f is IDataGridViewEditingControl || f is DataGridView) return;     // the grids keep their own Enter
+                bool box = f is TextBox || f is NumericUpDown || f.Parent is NumericUpDown;
+                if (!box) return;
+                e.SuppressKeyPress = true; e.Handled = true;
+                SelectNextControl(f.Parent is NumericUpDown ? f.Parent : f, true, true, true, true);
+            };
             FormClosed += (s, e) =>
             {
                 try { SaveSettings(); } catch { }
                 try { _preview.Dispose(); } catch { }
             };
+        }
+
+        private static Control FindFocused(Control c)
+        {
+            while (c is ContainerControl cc && cc.ActiveControl != null) c = cc.ActiveControl;
+            if (c != null && !c.Focused) foreach (Control k in c.Controls) { Control f = k.Focused ? k : FindFocusedChild(k); if (f != null) return f; }
+            return c;
+        }
+
+        private static Control FindFocusedChild(Control c)
+        {
+            foreach (Control k in c.Controls) { if (k.Focused) return k; Control f = FindFocusedChild(k); if (f != null) return f; }
+            return null;
         }
 
         // a picture of every page the user opens (Desktop\AB Bridges screens)
@@ -141,17 +174,35 @@ namespace ABBridges
             t.Start();
         }
 
+        // a bar between the drawing (fill) and the lists under it: drag it to make one bigger and the other smaller;
+        // the height is kept for the next time (this Civil 3D session)
+        private static readonly Dictionary<string, int> s_split = new Dictionary<string, int>();
+        private static void AddSplit(Control parent, Control bottom, string key)
+        {
+            if (s_split.TryGetValue(key, out int h)) bottom.Height = h;
+            var sp = new Splitter { Dock = DockStyle.Bottom, Height = 7, BackColor = Color.FromArgb(214, 220, 228), MinSize = 90, MinExtra = 140, Cursor = Cursors.HSplit };
+            sp.Paint += (s, e) =>
+            {
+                int cx = sp.Width / 2, cy = sp.Height / 2;
+                using (var b = new SolidBrush(Color.FromArgb(140, 150, 165)))
+                    for (int i = -2; i <= 2; i++) e.Graphics.FillEllipse(b, cx + i * 8 - 1.5f, cy - 1.5f, 3, 3);
+            };
+            sp.SplitterMoved += (s, e) => s_split[key] = bottom.Height;
+            parent.Controls.Add(sp);
+            parent.Controls.Add(bottom);
+        }
+
         private static GroupBox Card(string text) =>
             new GroupBox { Text = text, Dock = DockStyle.Fill, Font = Theme.Bold, ForeColor = Theme.Navy, BackColor = Color.White, Padding = new Padding(8) };
 
         // one "pick" line: button, status, optional List / Clear
         private Label PickRow(Control parent, ref int y, string text, Action pick, Action clear, Action list = null)
         {
-            var b = Btn(text, 10, y, (s, e) => pick(), 118); b.Font = Theme.Body; b.ForeColor = Color.Black;
+            var b = Btn(text, 10, y, (s, e) => pick(), 118);
             parent.Controls.Add(b);
-            int x = 132;
-            if (list != null) { var bl = Btn("List", x, y, (s, e) => list(), 44); bl.Font = Theme.Body; bl.ForeColor = Color.Black; parent.Controls.Add(bl); x += 48; }
-            if (clear != null) { var bc = Btn("Clear", x, y, (s, e) => { clear(); UpdateStatusLabels(); RefreshSetupPlan(); }, 50); bc.Font = Theme.Body; bc.ForeColor = Color.Firebrick; parent.Controls.Add(bc); }
+            int x = 134;
+            if (list != null) { var bl = Btn("List", x, y, (s, e) => list(), 50); parent.Controls.Add(bl); x += 56; }
+            if (clear != null) { var bc = Btn("Clear", x, y, (s, e) => { clear(); UpdateStatusLabels(); RefreshSetupPlan(); }, 56, Look.Danger); parent.Controls.Add(bc); }
             Label lb = Status(10, y + 24, 320);
             lb.Font = Theme.Body;
             lb.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right;
@@ -165,9 +216,9 @@ namespace ABBridges
         private void BuildSetup()
         {
             var p = _tpSetup;
-            _planSetup = new PlanView { Dock = DockStyle.Top, Height = 260, Title = "Plan of the selected objects" };
+            _planSetup = new PlanView { Dock = DockStyle.Fill, Title = "Plan of the selected objects" };
 
-            var cols = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Padding = new Padding(0, 8, 0, 0) };
+            var cols = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 218, ColumnCount = 3, RowCount = 1, Padding = new Padding(0, 8, 0, 0) };
             for (int i = 0; i < 3; i++) cols.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
 
             // column 1: alignment, CL, edges
@@ -184,8 +235,8 @@ namespace ABBridges
                 RefreshSetupPlan();
             };
             g1.Controls.Add(_cbReverse);
-            var ls = Lbl("Start station", 150, y - 2, 80); ls.Font = Theme.Body; ls.ForeColor = Color.Black; g1.Controls.Add(ls);
-            _tbStartSta = Txt(232, y - 5, 90); _tbStartSta.Font = Theme.Body;
+            var ls = Lbl("Start station", 150, y - 2, 80); ls.Font = Theme.Body; ls.ForeColor = Color.Black; ls.AutoSize = true; g1.Controls.Add(ls);
+            _tbStartSta = Txt(150 + ls.PreferredWidth + 6, y - 5, 90); _tbStartSta.Font = Theme.Body;
             _tbStartSta.Leave += (s, e) => { RefreshAxes(); RefreshSetupPlan(); };
             g1.Controls.Add(_tbStartSta);
             y += 28;
@@ -201,24 +252,27 @@ namespace ABBridges
             _lbNgl = PickRow(g2, ref y, "NGL...", () => PickSurfaces(1), () => BridgeSettings.NglIds = new List<ObjectId>(), () => ListSurfaces(1));
             _lbUnder = PickRow(g2, ref y, "Roads below...", () => PickSurfaces(2), () => BridgeSettings.UnderIds = new List<ObjectId>(), () => ListSurfaces(2));
 
-            // column 3: bridge, axes, output
-            GroupBox g3 = Card("Bridge and Axes");
-            y = 24;
-            var ln = Lbl("Name", 10, y + 3, 40); ln.Font = Theme.Body; ln.ForeColor = Color.Black; g3.Controls.Add(ln);
-            _tbName = Txt(56, y, 260); _tbName.Font = Theme.Body; _tbName.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right;
+            // top left, over the plan: the bridge name (= the Excel name) and the output options
+            var top = new Panel { Dock = DockStyle.Top, Height = 60, BackColor = Theme.Page };
+            var ln = new Label { Text = "Name", AutoSize = true, Location = new Point(2, 9), Font = Theme.Bold, ForeColor = Theme.Navy };
+            top.Controls.Add(ln);
+            _tbName = Txt(ln.PreferredWidth + 10, 5, 280); _tbName.Font = Theme.Body;
             _tbName.TextChanged += (s, e) => UpdateFileLabel();
-            g3.Controls.Add(_tbName);
-            y += 34;
+            top.Controls.Add(_tbName);
+            _lbFile = new Label { Location = new Point(_tbName.Right + 12, 9), Size = new Size(620, 20), ForeColor = Color.DimGray, Font = Theme.Body, AutoEllipsis = true };
+            top.Controls.Add(_lbFile);
+            _cbFeature = Chk("Draw feature lines", 2, 35); _cbFeature.Font = Theme.Body; _cbFeature.ForeColor = Color.Black; top.Controls.Add(_cbFeature);
+            _cbReplace = Chk("Replace previous run", 160, 35); _cbReplace.Font = Theme.Body; _cbReplace.ForeColor = Color.Black; top.Controls.Add(_cbReplace);
+
+            // column 3: axes
+            GroupBox g3 = Card("Axes");
+            y = 22;
             _lbAxes = PickRow(g3, ref y, "Axes...", PickAxes, () => { BridgeSettings.AxisIds = new List<ObjectId>(); RefreshAxes(); });
-            _lbFile = new Label { Location = new Point(10, y), Size = new Size(320, 34), ForeColor = Color.DimGray, Font = Theme.Body, AutoEllipsis = true, Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right };
-            g3.Controls.Add(_lbFile);
-            y += 36;
-            _cbFeature = Chk("Draw feature lines", 10, y); _cbFeature.Font = Theme.Body; _cbFeature.ForeColor = Color.Black; g3.Controls.Add(_cbFeature);
-            _cbReplace = Chk("Replace previous run", 160, y); _cbReplace.Font = Theme.Body; _cbReplace.ForeColor = Color.Black; g3.Controls.Add(_cbReplace);
 
             cols.Controls.Add(g1, 0, 0); cols.Controls.Add(g2, 1, 0); cols.Controls.Add(g3, 2, 0);
-            p.Controls.Add(cols);
             p.Controls.Add(_planSetup);
+            AddSplit(p, cols, "setup");
+            p.Controls.Add(top);
         }
 
         // ---------------------------------------------------------------- Internal Diaphragm tab
@@ -226,28 +280,51 @@ namespace ABBridges
         private void BuildInternal()
         {
             var p = _tpId;
-            _planId = new PlanView { Dock = DockStyle.Top, Height = 300, Title = "Internal diaphragms (equal along the CL, stations on the alignment)", ScaleY = 3f };
+            _planId = new PlanView { Dock = DockStyle.Fill, Title = "Internal diaphragms (equal along the CL, stations on the alignment)", FitWidth = true };
+            var bottom = new Panel { Dock = DockStyle.Bottom, Height = 200, Padding = new Padding(0, 6, 0, 0) };
             var bar = new Panel { Dock = DockStyle.Top, Height = 36 };
             _cbIdAll = new CheckBox { Text = "Apply a change to all spans", Location = new Point(4, 9), AutoSize = true, Checked = BridgeSettings.InternalAll };
             _cbIdAll.CheckedChanged += (s, e) => BridgeSettings.InternalAll = _cbIdAll.Checked;
             bar.Controls.Add(_cbIdAll);
-            bar.Controls.Add(Lbl("Every internal diaphragm = 2 sections, Gap apart. Count 0 = none in that span.", 230, 11, 600));
+            bar.Controls.Add(Lbl("Tick the spans that have internal diaphragms. Every one = 2 sections, Gap apart, equal along the span length (Centerline).", 230, 11, 760));
+            var idReset = Btn("Reset lengths", 0, 4, (s, e) =>
+            {
+                foreach (CjSpan v in BridgeSettings.Cj.Values) v.UserLength = null;          // the shared span lengths
+                EnsureStations(true); FillId();
+            }, 120);
+            idReset.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            bar.Controls.Add(idReset);
+            bar.Resize += (s, e) => idReset.Left = bar.Width - idReset.Width - 2;
 
             _gridId = new DataGridView
             {
                 Dock = DockStyle.Fill, AllowUserToAddRows = false, AllowUserToDeleteRows = false, RowHeadersVisible = false,
                 AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, BackgroundColor = Color.White, SelectionMode = DataGridViewSelectionMode.CellSelect
             };
-            _gridId.Columns.Add(Col("Span", "Span", 14, true));
-            _gridId.Columns.Add(Col("Length", "Length (CL)", 14, true));
-            _gridId.Columns.Add(Col("Count", "Internal diaphragms", 14));
-            _gridId.Columns.Add(Col("Gap", "Gap between its 2 sections", 16));
-            _gridId.Columns.Add(Col("Spacing", "Spacing", 12, true));
+            _gridId.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Use", HeaderText = "Use", FillWeight = 6 });
+            _gridId.Columns.Add(Col("Span", "Span", 12, true));
+            _gridId.Columns.Add(Col("Length", "Length (CL)", 13));
+            _gridId.Columns.Add(Col("Count", "Internal diaphragms", 13));
+            _gridId.Columns.Add(Col("Gap", "Gap between its 2 sections", 15));
+            _gridId.Columns.Add(Col("Spacing", "Spacing", 11, true));
             _gridId.Columns.Add(Col("At", "Centres at", 30, true));
-            _gridId.CellEndEdit += (s, e) => ReadIdRow(e.RowIndex);
-            p.Controls.Add(_gridId);
-            p.Controls.Add(bar);
+            _gridId.CellEndEdit += (s, e) => ReadIdRow(e.RowIndex, e.ColumnIndex);
+            _gridId.CurrentCellDirtyStateChanged += (s, e) =>
+            {
+                if (_gridId.IsCurrentCellDirty && _gridId.CurrentCell is DataGridViewCheckBoxCell) _gridId.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+            _gridId.CellContentClick += (s, e) =>
+            {
+                if (e.RowIndex >= 0 && _gridId.Columns[e.ColumnIndex].Name == "Use") _gridId.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+            _gridId.CellValueChanged += (s, e) =>
+            {
+                if (!_idFill && e.RowIndex >= 0 && _gridId.Columns[e.ColumnIndex].Name == "Use") ReadIdRow(e.RowIndex, e.ColumnIndex);
+            };
+            bottom.Controls.Add(_gridId);
+            bottom.Controls.Add(bar);
             p.Controls.Add(_planId);
+            AddSplit(p, bottom, "id");
         }
 
         // ---------------------------------------------------------------- Construction Joint tab
@@ -255,13 +332,19 @@ namespace ABBridges
         private void BuildCj()
         {
             var p = _tpCj;
-            p.Controls.Add(Lbl("Tick the spans that need construction joints.  CJ1 = axis station + Factor × Length;  CJ2 = CJ1 + Dist 1;  CJ3 = CJ2 + Dist 2.", 10, 10, 676));
-            _lbCjMode = new Label { Location = new Point(10, 32), Size = new Size(560, 18), ForeColor = Color.DimGray };
-            p.Controls.Add(_lbCjMode);
-            p.Controls.Add(Btn("Reset lengths", 576, 28, (s, e) => ResetCjLengths(), 108));
+            _planCj = new PlanView { Dock = DockStyle.Fill, Title = "Construction joints (CJ1 · CJ2 · CJ3 dashed purple)", FitWidth = true };
+            var bottom = new Panel { Dock = DockStyle.Bottom, Height = 250, Padding = new Padding(0, 6, 0, 0) };
+            var bar = new Panel { Dock = DockStyle.Top, Height = 54 };
+            bar.Controls.Add(Lbl("Tick the spans that need construction joints.  CJ1 = axis station + Factor × Length;  CJ2 = CJ1 + Dist 1;  CJ3 = CJ2 + Dist 2.", 4, 6, 900));
+            _lbCjMode = new Label { Location = new Point(4, 30), Size = new Size(700, 18), ForeColor = Color.DimGray };
+            bar.Controls.Add(_lbCjMode);
+            var reset = Btn("Reset lengths", 0, 22, (s, e) => ResetCjLengths(), 120);
+            reset.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            bar.Controls.Add(reset);
+            bar.Resize += (s, e) => reset.Left = bar.Width - reset.Width - 2;
 
-            _gridCj = Grid(10, 60, 674, 470);
-            _gridCj.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom;
+            _gridCj = Grid(0, 0, 10, 10);
+            _gridCj.Dock = DockStyle.Fill;
             _gridCj.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Use", HeaderText = "Use", FillWeight = 6 });
             _gridCj.Columns.Add(Col("Span", "Span", 10, true));
             _gridCj.Columns.Add(Col("FromTo", "From → To", 22, true));
@@ -276,10 +359,23 @@ namespace ABBridges
             {
                 if (_gridCj.IsCurrentCellDirty && _gridCj.CurrentCell is DataGridViewCheckBoxCell) _gridCj.CommitEdit(DataGridViewDataErrorContexts.Commit);
             };
-            _gridCj.CellValueChanged += (s, e) => { if (!_filling && e.RowIndex >= 0) ReadCjRow(e.RowIndex); };
-            p.Controls.Add(_gridCj);
-            p.Controls.Add(Lbl("Length = span length from axis to axis: from the Centerline when it is picked in Setup, otherwise the center " +
-                               "between the edges. You can type another length (highlighted); Reset lengths brings back the computed value.", 10, 540, 674, 48));
+            _gridCj.CellValueChanged += (s, e) =>
+            {
+                if (_filling || e.RowIndex < 0) return;
+                ReadCjRow(e.RowIndex);
+                BeginInvoke((Action)(() => { try { DrawCjPlan(); } catch (Exception ex) { SetMessage("Construction joints: " + ex.Message, true); } }));   // after the click is done
+            };
+            var note = new Label
+            {
+                Dock = DockStyle.Bottom, Height = 34, ForeColor = Color.DimGray,
+                Text = "Length = span length from axis to axis: from the Centerline when it is picked in Setup, otherwise the center " +
+                       "between the edges. You can type another length (highlighted); Reset lengths brings back the computed value."
+            };
+            bottom.Controls.Add(_gridCj);
+            bottom.Controls.Add(note);
+            bottom.Controls.Add(bar);
+            p.Controls.Add(_planCj);
+            AddSplit(p, bottom, "cj");
         }
 
         // ---------------------------------------------------------------- Under Bridge Cross tab
@@ -287,34 +383,30 @@ namespace ABBridges
         private void BuildCross()
         {
             var p = _tpCross;
-            p.Controls.Add(Lbl("Roads under the bridge (between the corbels). Clearance = bridge level − road level − depth. Type the bridge depth of every road.", 10, 10, 580, 34));
-            p.Controls.Add(Btn("Recalculate", 596, 12, (s, e) => RefreshCross(), 88));
+            _planRoads = new RoadsView { Dock = DockStyle.Fill };
+            var bottom = new Panel { Dock = DockStyle.Bottom, Height = 230, Padding = new Padding(0, 6, 0, 0) };
+            var bar = new Panel { Dock = DockStyle.Top, Height = 36 };
+            bar.Controls.Add(Lbl("Type the bridge depth of every road.  Clearance = bridge level − road level − depth  (the points are in the Excel).", 4, 9, 900));
+            var recalc = Btn("Recalculate", 0, 4, (s, e) => RefreshCross(), 110);
+            recalc.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            bar.Controls.Add(recalc);
+            bar.Resize += (s, e) => recalc.Left = bar.Width - recalc.Width - 2;
 
-            _gridRoads = Grid(10, 48, 674, 170);
-            _gridRoads.Columns.Add(Col("Road", "Road", 30, true));
-            _gridRoads.Columns.Add(Col("From", "From", 14, true));
-            _gridRoads.Columns.Add(Col("To", "To", 14, true));
-            _gridRoads.Columns.Add(Col("Points", "Points", 9, true));
-            _gridRoads.Columns.Add(Col("Depth", "Depth", 11));
-            _gridRoads.Columns.Add(Col("MinClr", "Min clearance", 14, true));
-            _gridRoads.SelectionChanged += (s, e) => FillCrossPoints();
+            _gridRoads = Grid(0, 0, 10, 10);
+            _gridRoads.Dock = DockStyle.Fill;
+            _gridRoads.Columns.Add(Col("Road", "Road", 34, true));
+            _gridRoads.Columns.Add(Col("From", "From", 16, true));
+            _gridRoads.Columns.Add(Col("To", "To", 16, true));
+            _gridRoads.Columns.Add(Col("Depth", "Depth (m)", 14));
+            _gridRoads.Columns.Add(Col("MinClr", "Clearance (m)", 16, true));
             _gridRoads.CellEndEdit += (s, e) => ReadDepth(e.RowIndex);
-            p.Controls.Add(_gridRoads);
 
-            _lbMinClr = new Label { Location = new Point(10, 224), Size = new Size(674, 20), ForeColor = Color.FromArgb(190, 30, 30), Font = new System.Drawing.Font("Segoe UI", 9.5f, FontStyle.Bold) };
-            p.Controls.Add(_lbMinClr);
-
-            _gridPts = Grid(10, 248, 674, 370);
-            _gridPts.Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom;
-            _gridPts.Columns.Add(Col("No", "No", 6, true));
-            _gridPts.Columns.Add(Col("Point", "Point", 9, true));
-            _gridPts.Columns.Add(Col("Station", "Station", 13, true));
-            _gridPts.Columns.Add(Col("X", "X", 14, true));
-            _gridPts.Columns.Add(Col("Y", "Y", 14, true));
-            _gridPts.Columns.Add(Col("RoadZ", "Road Z", 11, true));
-            _gridPts.Columns.Add(Col("BridgeZ", "Bridge Z", 11, true));
-            _gridPts.Columns.Add(Col("Clr", "Clearance", 11, true));
-            p.Controls.Add(_gridPts);
+            _lbMinClr = new Label { Dock = DockStyle.Bottom, Height = 26, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.FromArgb(190, 30, 30), Font = new System.Drawing.Font("Segoe UI", 9.5f, FontStyle.Bold) };
+            bottom.Controls.Add(_gridRoads);
+            bottom.Controls.Add(_lbMinClr);
+            bottom.Controls.Add(bar);
+            p.Controls.Add(_planRoads);
+            AddSplit(p, bottom, "roads");
         }
 
         // ---------------------------------------------------------------- Stations tab
@@ -322,28 +414,43 @@ namespace ABBridges
         private void BuildStations()
         {
             var p = _tpSt;
-            _planSt = new PlanView { Dock = DockStyle.Top, Height = 300, Title = "Sections plan (live)", ScaleY = 3f };
+            _planSt = new PlanView { Dock = DockStyle.Fill, Title = "Sections plan (live)   —   click: one more part   ·   Shift + click: one part less (equal spacing)", FitWidth = true, Interactive = true };
+            _planSt.WorldClick += (x, shift) => { if (shift) DeleteStationNear(x); else AddStationAt(x); };
+            _planSt.DeletableNear = x => { Section s = DeletableAt(x); return s == null ? (float?)null : (float)s.Station; };
+            var bottom = new Panel { Dock = DockStyle.Bottom, Height = 250, Padding = new Padding(0, 4, 0, 0) };
 
             var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40, WrapContents = false, Padding = new Padding(0, 6, 0, 0) };
             Func<string, Control> L = t => new Label { Text = t, AutoSize = true, Margin = new Padding(8, 6, 2, 0) };
             _nudNear = new NumericUpDown { Width = 46, Minimum = 0, Maximum = 6, Value = BridgeSettings.NearDist.Count };
-            _tbNear = new TextBox { Width = 150, Text = string.Join("; ", BridgeSettings.NearDist.Select(d => d.ToString("0.00", CI))) };
+            _nearBoxes = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0, 2, 0, 0) };
             _nudNear.ValueChanged += (s, e) => { if (!_filling) NearCountChanged(); };
-            _tbNear.Leave += (s, e) => NearChanged();
+            BuildNearBoxes();
             _tbCorbelStart = new TextBox { Width = 56 }; _tbCorbelEnd = new TextBox { Width = 56 }; _tbSpacing = new TextBox { Width = 56 };
             foreach (TextBox t in new[] { _tbCorbelStart, _tbCorbelEnd, _tbSpacing }) t.Leave += (s, e) => { SaveSettings(); EnsureStations(true); };
             _nudSkew = new NumericUpDown { Width = 46, Minimum = 0, Maximum = 30 };
             _nudSkew.ValueChanged += (s, e) => { if (!_filling) SkewChanged(); };
             bar.Controls.AddRange(new Control[] {
-                L("Stations near diaphragm"), _nudNear, L("at (m from face)"), _tbNear,
+                L("Stations near diaphragm"), _nudNear, L("at (m from face)"), _nearBoxes,
                 L("Corbel start"), _tbCorbelStart, L("end"), _tbCorbelEnd, L("Max spacing"), _tbSpacing, L("Skew transition"), _nudSkew });
 
             var bar2 = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 36, WrapContents = false };
             bar2.Controls.Add(Btn("Reset", 0, 0, (s, e) => ResetStations(), 80));
-            bar2.Controls.Add(Btn("Add station", 0, 0, (s, e) => AddStation(), 100));
-            bar2.Controls.Add(Btn("Delete", 0, 0, (s, e) => DeleteStations(), 80));
+            var bAdd = Btn("Add station", 0, 0, (s, e) => AddStation(), 100);
+            var bDel = Btn("Delete", 0, 0, (s, e) => DeleteStations(), 80, Look.Danger);
+            _bStList = Btn("Show list ▸", 0, 0, null, 110);
+            bar2.Controls.AddRange(new Control[] { bAdd, bDel, _bStList });
+            bAdd.Visible = bDel.Visible = false;
 
-            var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 380 };
+            var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 380, Panel2Collapsed = true };
+            _stSplit = split;
+            _bStList.Click += (s, e) =>
+            {
+                split.Panel2Collapsed = !split.Panel2Collapsed;
+                bool on = !split.Panel2Collapsed;
+                _bStList.Text = on ? "Hide list ◂" : "Show list ▸";
+                bAdd.Visible = bDel.Visible = on;
+                bottom.Height = on ? 380 : 250;
+            };
             _gridAxes = Grid(0, 0, 10, 10); _gridAxes.Dock = DockStyle.Fill;
             _gridAxes.Columns.Add(Col("Name", "Axis", 12));
             _gridAxes.Columns.Add(Col("Chainage", "Chainage", 16, true));
@@ -371,10 +478,11 @@ namespace ABBridges
             _gridSt.CellEndEdit += (s, e) => StationEdited(e.RowIndex);
             split.Panel2.Controls.Add(_gridSt);
 
-            p.Controls.Add(split);
-            p.Controls.Add(bar2);
-            p.Controls.Add(bar);
+            bottom.Controls.Add(split);
+            bottom.Controls.Add(bar2);
+            bottom.Controls.Add(bar);
             p.Controls.Add(_planSt);
+            AddSplit(p, bottom, "st");
         }
 
         // ---------------------------------------------------------------- small helpers
@@ -392,9 +500,9 @@ namespace ABBridges
 
         private static CheckBox Chk(string text, int x, int y) => new CheckBox { Text = text, Location = new Point(x, y), AutoSize = true };
 
-        private static Button Btn(string text, int x, int y, EventHandler click, int w = 122)
+        private static NiceButton Btn(string text, int x, int y, EventHandler click, int w = 122, Look look = Look.Normal)
         {
-            var b = new Button { Text = text, Location = new Point(x, y), Size = new Size(w, 26) };
+            var b = new NiceButton { Text = text, Location = new Point(x, y), Size = new Size(w, 28), Look = look };
             b.Click += click;
             return b;
         }
@@ -745,33 +853,68 @@ namespace ABBridges
         {
             if (_planSetup == null) return;
             _planSetup.Clear();
+            _planSetup.ClipX0 = _planSetup.ClipX1 = null;
             try
             {
+                // the bridge turned to lie along the page: x from the first axis towards the last one, y across;
+                // only the first axis - 5 m .. the last axis + 5 m is shown
+                Func<Point3d, PointF> R = p => new PointF((float)p.X, (float)p.Y);
+                var ax = _axes.OrderBy(a => a.Station).ToList();
+                if (ax.Count >= 2)
+                {
+                    Point3d o = ax.First().ClPoint;
+                    Vector3d d = ax.Last().ClPoint - o;
+                    double len = Math.Sqrt(d.X * d.X + d.Y * d.Y);
+                    if (len > 1e-6)
+                    {
+                        double ux = d.X / len, uy = d.Y / len;
+                        R = p => new PointF((float)((p.X - o.X) * ux + (p.Y - o.Y) * uy), (float)(-(p.X - o.X) * uy + (p.Y - o.Y) * ux));
+                        _planSetup.ClipX0 = -5f; _planSetup.ClipX1 = (float)len + 5f;
+                    }
+                }
+                Func<Curve, int, List<PointF>> sample = (c, n) =>
+                {
+                    var pts = new List<PointF>();
+                    double l = c.GetDistanceAtParameter(c.EndParam);
+                    for (int i = 0; i <= n; i++) pts.Add(R(c.GetPointAtDist(l * i / n)));
+                    return pts;
+                };
                 using (Transaction tr = _db.TransactionManager.StartOpenCloseTransaction())
                 {
-                    Action<ObjectId, Color, float, bool> draw = (id, col, w, dash) =>
+                    Action<ObjectId, Color, float, bool, bool> draw = (id, col, w, dash, fit) =>
                     {
                         if (!Valid(id)) return;
-                        using (Curve c = Geo.LoadFlat(tr, id)) _planSetup.Line(Sample(c), col, w, dash);
+                        using (Curve c = Geo.LoadFlat(tr, id)) _planSetup.Line(sample(c, 400), col, w, dash, fit);
                     };
-                    foreach (ObjectId id in BridgeSettings.LeftIds) draw(id, Theme.Edge, 1.6f, false);
-                    foreach (ObjectId id in BridgeSettings.RightIds) draw(id, Theme.Edge, 1.6f, false);
-                    draw(BridgeSettings.CenterlineId, Theme.CenterLine, 1f, true);
+                    foreach (ObjectId id in BridgeSettings.LeftIds) draw(id, Theme.Edge, 1.6f, false, true);
+                    foreach (ObjectId id in BridgeSettings.RightIds) draw(id, Theme.Edge, 1.6f, false, true);
+                    draw(BridgeSettings.CenterlineId, Theme.CenterLine, 1f, true, true);
                     if (Valid(BridgeSettings.AlignmentId))
                     {
                         using (Curve al = Geo.LoadAlignment(tr))
                         {
-                            List<PointF> pts = Sample(al, 200);
+                            List<PointF> pts = sample(al, 1000);
                             if (BridgeSettings.ReverseAlignment) pts.Reverse();
                             _planSetup.Line(pts, Theme.Alignment, 1.4f, true);
-                            PointF e1 = pts[pts.Count - 2], e2 = pts[pts.Count - 1];
-                            _planSetup.Text(e2, "▶ direction", Theme.Alignment, 8f, 0, -16);
+                            // the direction arrow at the right end of the shown part
+                            PointF tip = _planSetup.ClipX1.HasValue
+                                ? pts.Where(q => q.X <= _planSetup.ClipX1.Value - 1).OrderByDescending(q => q.X).DefaultIfEmpty(pts.Last()).First()
+                                : pts.Last();
+                            _planSetup.Text(tip, "direction ▶", Theme.Alignment, 8f, -30, -18);
                         }
                     }
                     foreach (AxisInfo a in _axes)
                     {
-                        draw(a.Id, Theme.Axis, 1.6f, false);
-                        _planSetup.Text(new PointF((float)a.ClPoint.X, (float)a.ClPoint.Y), a.Name, Theme.Axis, 9f, 0, 14, true);
+                        draw(a.Id, Theme.Axis, 1.8f, false, false);
+                        _planSetup.Text(R(a.ClPoint), a.Name, Theme.Axis, 10f, 0, 14, true);
+                    }
+                    // span lengths (axis to axis along the CL points) on top
+                    for (int i = 0; i + 1 < ax.Count; i++)
+                    {
+                        float x1 = R(ax[i].ClPoint).X, x2 = R(ax[i + 1].ClPoint).X;
+                        CjSpan sl = BridgeSettings.CjOf(BridgeSettings.SpanKey(ax[i], ax[i + 1]));     // the span length of the CJ / ID pages
+                        double len = !double.IsNaN(sl.Length) && sl.Length > 0 ? sl.Length : ax[i + 1].Station - ax[i].Station;
+                        _planSetup.Dim(x1, x2, len.ToString("0.000", CI), 6, "Span " + (i + 1), sl.UserLength.HasValue ? Theme.Accent : (Color?)null);
                     }
                     tr.Commit();
                 }
@@ -785,15 +928,19 @@ namespace ABBridges
         private void DrawSectionPlans()
         {
             if (_set == null) return;
-            foreach (PlanView pv in new[] { _planId, _planSt })
+            foreach (PlanView pv in new[] { _planId, _planSt, _planCj })
             {
                 if (pv == null) continue;
-                bool idOnly = pv == _planId;
+                bool idOnly = pv == _planId, cjOnly = pv == _planCj;
                 pv.Clear();
                 List<Section> secs = _set.Sections;
                 if (secs.Count == 0) { pv.Invalidate(); continue; }
                 float w = 5f;
                 float s0 = (float)secs.First().Station, s1 = (float)secs.Last().Station;
+                // shown: first axis - 5 m .. last axis + 5 m, the whole page width
+                List<Section> axs = secs.Where(x => x.Kind == SectionKind.Axis).ToList();
+                if (axs.Count > 0) { pv.ClipX0 = (float)axs.First().Station - 5f; pv.ClipX1 = (float)axs.Last().Station + 5f; }
+                else { pv.ClipX0 = s0 - 5f; pv.ClipX1 = s1 + 5f; }
                 pv.Line(new[] { new PointF(s0, w), new PointF(s1, w), new PointF(s1, -w), new PointF(s0, -w), new PointF(s0, w) }, Theme.Edge, 1.2f);
                 foreach (Section sc in secs)
                 {
@@ -805,22 +952,45 @@ namespace ABBridges
                         case SectionKind.DiaphragmFace: c = Theme.Axis; lw = 1f; break;
                         case SectionKind.Corbel: c = Theme.Corbel; lw = 1.4f; break;
                         case SectionKind.InternalDiaphragm: c = Theme.Internal; lw = 1.6f; break;
-                        case SectionKind.ConstructionJoint: c = Theme.Joint; lw = 1.2f; dash = true; break;
+                        case SectionKind.ConstructionJoint: c = Theme.Joint; lw = 1.6f; dash = true; break;
                         case SectionKind.NearDiaphragm: c = Color.FromArgb(110, 110, 110); break;
                         default: c = Theme.Division; dash = true; break;
                     }
-                    if (idOnly && (sc.Kind == SectionKind.Division || sc.Kind == SectionKind.NearDiaphragm)) continue;
+                    // the other sections stay visible on the ID / CJ pages, only lighter
+                    bool focus = idOnly ? sc.Kind == SectionKind.InternalDiaphragm : cjOnly ? sc.Kind == SectionKind.ConstructionJoint : true;
+                    if (!focus && sc.Kind != SectionKind.Axis && sc.Kind != SectionKind.DiaphragmFace && sc.Kind != SectionKind.Corbel)
+                    { c = Color.FromArgb(200, 204, 210); lw = 0.7f; }
                     float ext = sc.Kind == SectionKind.Axis ? 2.2f : 0f;
-                    pv.Line(new[] { new PointF(x, w + ext), new PointF(x, -w - ext) }, c, lw, dash);
+                    // the skew: the section line turned by its angle (seen in the plan: where the cut goes from / to)
+                    float t = (float)Math.Tan(Math.Max(-80, Math.Min(80, sc.SkewDeg)) * Math.PI / 180.0);
+                    float top = w + ext, bot = -w - ext;
+                    pv.Line(new[] { new PointF(x - t * top, top), new PointF(x - t * bot, bot) }, c, lw, dash);
                 }
                 // axis to axis (span) dims on top, Span n under the value
+                // one dim per span: its length (the length of the table on the CJ / ID pages, orange when typed) + "Span n"
                 List<Section> ax = secs.Where(x => x.Kind == SectionKind.Axis).ToList();
                 for (int i = 0; i + 1 < ax.Count; i++)
-                    pv.Dim((float)ax[i].Station, (float)ax[i + 1].Station, (ax[i + 1].Station - ax[i].Station).ToString("0.000", CI), 30, "Span " + (i + 1));
-                // section to section dims (second row)
-                List<Section> chain = idOnly ? secs.Where(x => x.Kind != SectionKind.Division && x.Kind != SectionKind.NearDiaphragm).ToList() : secs;
+                {
+                    double len = ax[i + 1].Station - ax[i].Station;
+                    Color? col = null;
+                    SpanInfo spi = i < _set.Spans.Count ? _set.Spans[i] : null;
+                    if (spi != null)
+                    {
+                        double tl = BridgeSettings.CjOf(spi.Key).Length;          // one span length for every page
+                        bool typed = BridgeSettings.CjOf(spi.Key).UserLength.HasValue;
+                        if (!double.IsNaN(tl) && tl > 0) len = tl;
+                        if (typed) col = Theme.Accent;
+                    }
+                    pv.Dim((float)ax[i].Station, (float)ax[i + 1].Station, len.ToString("0.000", CI), 48, "Span " + (i + 1), col);
+                }
+                // section to section dims (second row) - not axis to axis (that is the span dim above)
+                List<Section> chain = idOnly ? secs.Where(x => x.Kind != SectionKind.Division && x.Kind != SectionKind.NearDiaphragm).ToList()
+                                    : cjOnly ? secs.Where(x => x.Kind == SectionKind.Axis || x.Kind == SectionKind.ConstructionJoint).ToList() : secs;
                 for (int i = 0; i + 1 < chain.Count; i++)
+                {
+                    if (chain[i].Kind == SectionKind.Axis && chain[i + 1].Kind == SectionKind.Axis) continue;
                     pv.Dim((float)chain[i].Station, (float)chain[i + 1].Station, (chain[i + 1].Station - chain[i].Station).ToString("0.00", CI), 4);
+                }
                 // names under the deck: axis + diaphragm number, corbels, internal diaphragms; division count in the middle
                 int d = 0, cb = 0;
                 foreach (Section sc in secs)
@@ -830,8 +1000,10 @@ namespace ABBridges
                     else if (sc.Kind == SectionKind.Corbel) pv.Text(at, "C" + (++cb), Theme.Corbel, 8f, 0, 32);
                     else if (sc.Kind == SectionKind.InternalDiaphragm && sc.Remark.EndsWith(" L"))
                         pv.Text(at, sc.Remark.Substring(sc.Remark.LastIndexOf("ID", StringComparison.Ordinal)).Replace(" L", ""), Theme.Internal, 8f, 0, 32);
+                    else if (sc.Kind == SectionKind.ConstructionJoint && cjOnly)
+                        pv.Text(at, sc.Remark.Contains("CJ") ? sc.Remark.Substring(sc.Remark.LastIndexOf("CJ", StringComparison.Ordinal)) : "CJ", Theme.Joint, 8f, 0, 32);
                 }
-                if (!idOnly)
+                if (!idOnly && !cjOnly)
                     foreach (SpanInfo sp in _set.Spans)
                     {
                         int n = secs.Count(x => x.Span == sp.Index && x.Kind == SectionKind.Division);
@@ -844,36 +1016,80 @@ namespace ABBridges
 
         // ================================================================ internal diaphragms
 
+        // the rows are updated in place (not cleared and made again while the grid is still finishing a click / edit:
+        // that failed, left _filling on and every later tick / count / gap was ignored)
         private void FillId()
         {
             if (_set == null || _gridId == null) return;
-            _filling = true;
-            _gridId.Rows.Clear();
-            foreach (SpanInfo sp in _set.Spans)
+            _idFill = true;
+            try
             {
-                IdSpan v = BridgeSettings.IdOf(sp.Key);
-                double L = sp.B.Station - sp.A.Station;
-                string at = string.Join("  ", _set.Sections.Where(x => x.Span == sp.Index && x.Kind == SectionKind.InternalDiaphragm && x.Remark.EndsWith(" L"))
-                                                         .Select(x => Fmt.Chainage(x.Station + v.Gap / 2)));
-                int row = _gridId.Rows.Add(sp.Name, L.ToString("0.000", CI), v.Count.ToString(CI), v.Gap.ToString("0.00", CI),
-                                           v.Count > 0 ? (L / (v.Count + 1)).ToString("0.000", CI) : "—", at);
-                _gridId.Rows[row].Tag = sp.Key;
+                if (_gridId.IsCurrentCellInEditMode) _gridId.EndEdit();
+                var spans = _set.Spans.ToList();
+                bool same = _gridId.Rows.Count == spans.Count && spans.Select((sp, i) => (_gridId.Rows[i].Tag as string) == sp.Key).All(x => x);
+                if (!same)
+                {
+                    _gridId.CurrentCell = null;
+                    _gridId.Rows.Clear();
+                    foreach (SpanInfo sp in spans) _gridId.Rows[_gridId.Rows.Add()].Tag = sp.Key;
+                }
+                for (int i = 0; i < spans.Count; i++)
+                {
+                    SpanInfo sp = spans[i];
+                    IdSpan v = BridgeSettings.IdOf(sp.Key);
+                    double L = v.Length;
+                    if (double.IsNaN(L) || L <= 0) L = sp.B.Station - sp.A.Station;
+                    bool on = v.Enabled && v.Count > 0;
+                    string at = string.Join("  ", _set.Sections.Where(x => x.Span == sp.Index && x.Kind == SectionKind.InternalDiaphragm && x.Remark.EndsWith(" L"))
+                                                             .Select(x => Fmt.Chainage(x.Station + v.Gap / 2)));
+                    DataGridViewRow r = _gridId.Rows[i];
+                    void Set(string c, object val) { if (!Equals(r.Cells[c].Value, val)) r.Cells[c].Value = val; }
+                    Set("Use", v.Enabled);
+                    Set("Span", sp.Name);
+                    Set("Length", L.ToString("0.000", CI));
+                    Set("Count", v.Count.ToString(CI));
+                    Set("Gap", v.Gap.ToString("0.00", CI));
+                    Set("Spacing", on ? (L / (v.Count + 1)).ToString("0.000", CI) : "—");
+                    Set("At", on ? at : "");
+                    r.Cells["Length"].Style.BackColor = v.UserLength.HasValue ? Color.FromArgb(255, 245, 200) : Color.Empty;
+                    foreach (string c in new[] { "Count", "Gap", "Spacing", "At" }) r.Cells[c].Style.ForeColor = v.Enabled ? Color.Empty : Color.Gray;
+                }
             }
-            _filling = false;
-            DrawSectionPlans();
+            catch (Exception ex) { SetMessage("Internal diaphragms: " + ex.Message, true); }
+            finally { _idFill = false; }
+            try { DrawSectionPlans(); } catch (Exception ex) { SetMessage("Internal diaphragms plan: " + ex.Message, true); }
         }
 
-        private void ReadIdRow(int row)
+        // Use + Length are per span; Count and Gap go to every span when "Apply a change to all spans" is ticked
+        private void ReadIdRow(int row, int col = -1)
         {
-            if (_filling || row < 0 || !(_gridId.Rows[row].Tag is string key)) return;
+            if (_idFill || row < 0 || !(_gridId.Rows[row].Tag is string key)) return;
+            DataGridViewRow r = _gridId.Rows[row];
             IdSpan v = BridgeSettings.IdOf(key);
-            if (!int.TryParse(Convert.ToString(_gridId.Rows[row].Cells["Count"].Value), out int n) || n < 0 || n > 20) n = v.Count;
-            if (!TryNum(Convert.ToString(_gridId.Rows[row].Cells["Gap"].Value), out double gap) || gap < 0 || gap > 5) gap = v.Gap;
-            IEnumerable<IdSpan> targets = BridgeSettings.InternalAll && _set != null ? _set.Spans.Select(sp => BridgeSettings.IdOf(sp.Key)) : new[] { v };
-            foreach (IdSpan t in targets) { t.Count = n; t.Gap = gap; }
-            EnsureStations(true);
-            FillId();
+            string colName = col >= 0 ? _gridId.Columns[col].Name : "";
+            if (colName == "Use" || colName == "") v.Enabled = Convert.ToBoolean(r.Cells["Use"].Value ?? false);
+            if (colName == "Length" && TryNum(Convert.ToString(r.Cells["Length"].Value), out double len) && len > 0)
+                v.UserLength = !double.IsNaN(v.AutoLength) && Math.Abs(len - v.AutoLength) < 0.0005 ? (double?)null : len;
+            if (colName == "Count" || colName == "Gap")
+            {
+                if (!int.TryParse(Convert.ToString(r.Cells["Count"].Value), out int n) || n < 0 || n > 20) n = v.Count;
+                if (!TryNum(Convert.ToString(r.Cells["Gap"].Value), out double gap) || gap < 0 || gap > 5) gap = v.Gap;
+                IEnumerable<IdSpan> targets = BridgeSettings.InternalAll && _set != null ? _set.Spans.Select(sp => BridgeSettings.IdOf(sp.Key)) : new[] { v };
+                foreach (IdSpan t in targets) { t.Count = n; t.Gap = gap; }
+            }
+            // the grid is rebuilt after the click / edit is finished: rebuilding it inside its own cell event
+            // fails quietly (the tick was kept but the plan never changed)
+            if (_idPending) return;
+            _idPending = true;
+            BeginInvoke((Action)(() =>
+            {
+                _idPending = false;
+                try { EnsureStations(true); FillId(); }
+                catch (Exception ex) { SetMessage("Internal diaphragms: " + ex.Message, true); }
+            }));
         }
+        private bool _idFill;     // own flag: a stuck _filling elsewhere must not block this page
+        private bool _idPending;
 
         // ================================================================ stations near the diaphragm
 
@@ -884,19 +1100,41 @@ namespace ABBridges
             while (list.Count > n) list.RemoveAt(list.Count - 1);
             while (list.Count < n) list.Add((list.Count == 0 ? 0 : list[list.Count - 1]) + 2.70);
             BridgeSettings.NearDist = list;
-            _tbNear.Text = string.Join("; ", list.Select(d => d.ToString("0.00", CI)));
+            BuildNearBoxes();
             EnsureStations(true);
+        }
+
+        // one small box per distance: "D1 [2.70]  D2 [5.40] ..."; a value is taken on Enter or when leaving the box
+        private void BuildNearBoxes()
+        {
+            if (_nearBoxes == null) return;
+            _nearBoxes.SuspendLayout();
+            _nearBoxes.Controls.Clear();
+            for (int i = 0; i < BridgeSettings.NearDist.Count; i++)
+            {
+                _nearBoxes.Controls.Add(new Label { Text = "D" + (i + 1), AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(i == 0 ? 2 : 8, 6, 2, 0) });
+                var tb = new TextBox { Width = 54, Text = BridgeSettings.NearDist[i].ToString("0.00", CI), Tag = i, Margin = new Padding(0, 2, 0, 0) };
+                tb.Leave += (s, e) => NearChanged();
+                _nearBoxes.Controls.Add(tb);
+            }
+            _nearBoxes.ResumeLayout();
         }
 
         private void NearChanged()
         {
             var list = new List<double>();
-            foreach (string part in _tbNear.Text.Split(new[] { ';', ',', ' ' }, StringSplitOptions.RemoveEmptyEntries))
-                if (TryNum(part, out double d) && d > 0) list.Add(d);
-            BridgeSettings.NearDist = list.OrderBy(x => x).ToList();
-            _filling = true; _nudNear.Value = Math.Min(6, list.Count); _filling = false;
-            _tbNear.Text = string.Join("; ", BridgeSettings.NearDist.Select(d => d.ToString("0.00", CI)));
-            EnsureStations(true);
+            bool bad = false;
+            foreach (TextBox tb in _nearBoxes.Controls.OfType<TextBox>())
+            {
+                if (TryNum(tb.Text, out double d) && d > 0) list.Add(d);
+                else bad = true;
+            }
+            list = list.OrderBy(x => x).ToList();
+            bool same = list.SequenceEqual(BridgeSettings.NearDist);
+            BridgeSettings.NearDist = list;
+            if (bad || !same) { _filling = true; _nudNear.Value = Math.Min(6, list.Count); _filling = false; BuildNearBoxes(); }
+            if (bad) SetMessage("A distance near the diaphragm is not a number - it was left out.", true);
+            if (!same) EnsureStations(true);
         }
 
         private void PickAxes()
@@ -917,7 +1155,14 @@ namespace ABBridges
 
         // ================================================================ axes grid
 
+        // the axes are found again -> the Setup plan is drawn again with them (cut to the first .. last axis, turned)
         private void RefreshAxes()
+        {
+            RefreshAxesCore();
+            RefreshSetupPlan();
+        }
+
+        private void RefreshAxesCore()
         {
             ReadAxesGrid();
             _axes = new List<AxisInfo>();
@@ -1043,7 +1288,7 @@ namespace ABBridges
         {
             if (e.TabPage == _tpSetup) return;
             if (!CheckSetup(e.TabPage == _tpCross)) { e.Cancel = true; return; }
-            if (e.TabPage == _tpCj) RefreshCj();
+            if (e.TabPage == _tpCj) { RefreshCj(); DrawCjPlan(); }
             else if (e.TabPage == _tpCross) RefreshCross();
             else if (e.TabPage == _tpId) { EnsureStations(false); FillId(); }
             else if (e.TabPage == _tpSt) EnsureStations(false);
@@ -1054,7 +1299,7 @@ namespace ABBridges
             if (_bNext == null) return;
             bool last = _tabs.SelectedTab == _tpSt;
             _bNext.Text = last ? "Generate Excel" : "Next →";
-            AcceptButton = last ? _bNext : null;
+            AcceptButton = null;          // Enter only takes the typed value; Generate Excel only by its button
         }
 
         private void DoNext()
@@ -1126,7 +1371,16 @@ namespace ABBridges
         private void ResetCjLengths()
         {
             foreach (CjSpan c in BridgeSettings.Cj.Values) c.UserLength = null;
-            if (_tabs.SelectedTab == _tpCj) RefreshCj();
+            if (_tabs.SelectedTab == _tpCj) { RefreshCj(); DrawCjPlan(); }
+        }
+
+        // the CJ page plan comes from the stations (they hold the joints); the message of the page is kept
+        private void DrawCjPlan()
+        {
+            string msg = _lbStatus.Text; Color col = _lbStatus.ForeColor;
+            try { EnsureStations(false); } catch { }
+            DrawSectionPlans();
+            _lbStatus.Text = msg; _lbStatus.ForeColor = col;
         }
 
         // ================================================================ Under Bridge Cross tab
@@ -1135,21 +1389,20 @@ namespace ABBridges
         {
             _crossings = new List<Crossing>();
             var warn = new List<string>();
-            if (BridgeSettings.UnderIds.Count(Valid) > 0)
+            WithModel((tr, m, w) =>
             {
-                WithModel((tr, m, w) =>
-                {
-                    StationSet tmp = Stations.Build(m, new List<string>());
-                    if (tmp.Sections.Count < 2) return;
-                    _crossings = Crossings.Compute(tr, m, tmp.Sections.First().Station, tmp.Sections.Last().Station, w);
-                }, warn);
-            }
+                try { ComputeProfiles(tr, m); } catch { }
+                if (BridgeSettings.UnderIds.Count(Valid) == 0) return;
+                StationSet tmp = Stations.Build(m, new List<string>());
+                if (tmp.Sections.Count < 2) return;
+                _crossings = Crossings.Compute(tr, m, tmp.Sections.First().Station, tmp.Sections.Last().Station, w);
+            }, warn);
 
             _filling = true;
             _gridRoads.Rows.Clear();
             foreach (Crossing c in _crossings)
             {
-                int row = _gridRoads.Rows.Add(c.Road, Fmt.Chainage(c.From), Fmt.Chainage(c.To), c.Points.Count.ToString(CI), Fmt.N3(c.Depth), Fmt.N3(c.MinClearance));
+                int row = _gridRoads.Rows.Add(c.Road, Fmt.Chainage(c.From), Fmt.Chainage(c.To), Fmt.N3(c.Depth), Fmt.N3(c.MinClearance));
                 _gridRoads.Rows[row].Tag = c;
             }
             _filling = false;
@@ -1187,19 +1440,42 @@ namespace ABBridges
             _lbMinClr.Text = worst == null ? "" : $"Bridge minimum clearance: {min.ToString("0.000", CI)} m   ({worst.Road})";
         }
 
+        // the longitudinal section of Roads Below: deck, roads with barriers, clearance, NGL, axes
         private void FillCrossPoints()
         {
-            _gridPts.Rows.Clear();
-            if (_gridRoads.CurrentRow == null || !(_gridRoads.CurrentRow.Tag is Crossing c)) return;
-            double depth = c.Depth, min = c.MinClearance;
-            int i = 0;
-            foreach (CrossPoint p in c.Points)
+            if (_planRoads == null) return;
+            var v = _planRoads;
+            v.Axes = _axes.Select(a => (a.Name, a.Station)).ToList();
+            v.DeckTop = _deckProf;
+            v.Ngl = _nglProf;
+            v.Roads = _crossings.Select(c => (c.Road, c.Depth,
+                                              c.Points.Where(p => !double.IsNaN(p.RoadZ)).Select(p => (p.Station, p.RoadZ)).ToList(),
+                                              c.Points.Select(p => (p.Station, p.BridgeZ)).ToList())).ToList();
+            var depths = _crossings.Select(c => c.Depth).Where(d => d > 0).ToList();
+            v.DeckDepth = depths.Count > 0 ? depths.Max() : double.NaN;
+            v.Message = _axes.Count < 2 ? "Pick the axes in Setup" : _deckProf.Count < 2 ? "Pick the design surface in Setup" : "No roads under the bridge";
+            v.Invalidate();
+        }
+
+        // design and NGL levels along the alignment, first axis - 6 m .. last axis + 6 m, every 0.5 m
+        private void ComputeProfiles(Transaction tr, BridgeModel m)
+        {
+            _deckProf = new List<(double, double)>();
+            _nglProf = new List<(double, double)>();
+            if (_axes.Count < 2) return;
+            double a = _axes.Min(x => x.Station) - 6, b = _axes.Max(x => x.Station) + 6;
+            var design = BridgeSettings.DesignIds.Count(Valid) > 0 ? new SurfaceSet(tr, BridgeSettings.DesignIds) : null;
+            var ngl = BridgeSettings.NglIds.Count(Valid) > 0 ? new SurfaceSet(tr, BridgeSettings.NglIds) : null;
+            int n = Math.Max(2, (int)Math.Ceiling((b - a) / 0.5));
+            for (int k = 0; k <= n; k++)
             {
-                double clr = p.Clearance(depth);
-                int row = _gridPts.Rows.Add((++i).ToString(CI), p.Name, Fmt.Chainage(p.Station), Fmt.N3(p.P.X), Fmt.N3(p.P.Y),
-                                            Fmt.N3(p.RoadZ), Fmt.N3(p.BridgeZ), Fmt.N3(clr));
-                if (!double.IsNaN(clr) && Math.Abs(clr - min) < 1e-9)
-                    _gridPts.Rows[row].DefaultCellStyle.BackColor = Color.FromArgb(253, 226, 226);
+                double st = a + (b - a) * k / n;
+                Point3d p;
+                try { p = m.Al.PointAt(st); } catch { continue; }
+                double? dz = design?.Z(p.X, p.Y);
+                if (dz.HasValue) _deckProf.Add((st, dz.Value));
+                double? gz = ngl?.Z(p.X, p.Y);
+                if (gz.HasValue) _nglProf.Add((st, gz.Value));
             }
         }
 
@@ -1216,7 +1492,10 @@ namespace ABBridges
             sb.Append('|').Append(BridgeSettings.CorbelStart.ToString("R", CI)).Append('|').Append(BridgeSettings.CorbelEnd.ToString("R", CI));
             sb.Append('|').Append(BridgeSettings.Spacing.ToString("R", CI));
             sb.Append("|N").Append(string.Join(",", BridgeSettings.NearDist.Select(d => d.ToString("R", CI))));
-            foreach (var kv in BridgeSettings.Internal) sb.Append("|I").Append(kv.Key).Append(':').Append(kv.Value.Count).Append(':').Append(kv.Value.Gap.ToString("R", CI));
+            foreach (var kv in BridgeSettings.DivExtra.OrderBy(k => k.Key)) sb.Append("|P").Append(kv.Key).Append(':').Append(kv.Value);
+            foreach (var kv in BridgeSettings.Internal)
+                sb.Append("|I").Append(kv.Key).Append(':').Append(kv.Value.Enabled ? kv.Value.Count : 0).Append(':').Append(kv.Value.Gap.ToString("R", CI))
+                  .Append(':').Append(kv.Value.Length.ToString("R", CI));
             foreach (AxisInfo a in _axes)
                 sb.Append('|').Append(a.Id.Handle).Append(':').Append(a.Diaphragm.ToString("R", CI)).Append(':')
                   .Append(a.BeforeD1.ToString("R", CI)).Append(':').Append(a.BeforeD2.ToString("R", CI)).Append(':')
@@ -1232,12 +1511,18 @@ namespace ABBridges
 
         private void EnsureStations(bool force)
         {
-            // the CJ lengths need the computed span lengths
-            if (BridgeSettings.Cj.Values.Any(c => c.Enabled && double.IsNaN(c.AutoLength) && !c.UserLength.HasValue))
+            // the CJ and internal diaphragm lengths need the computed span lengths (along the Centerline)
+            bool needCj = BridgeSettings.Cj.Values.Any(c => c.Enabled && double.IsNaN(c.AutoLength) && !c.UserLength.HasValue);
+            bool needId = _axes.Count > 1 && Enumerable.Range(0, _axes.Count - 1)
+                              .Any(i => double.IsNaN(BridgeSettings.IdOf(BridgeSettings.SpanKey(_axes[i], _axes[i + 1])).AutoLength));
+            if (needCj || needId)
                 WithModel((tr, m, w) =>
                 {
                     foreach (SpanLength sl in SpanLengths.Compute(m, new List<string>()))
+                    {
                         BridgeSettings.CjOf(sl.Key).AutoLength = sl.Length;
+                        BridgeSettings.IdOf(sl.Key).AutoLength = sl.Length;
+                    }
                 }, new List<string>());
 
             ReadAxesGrid();
@@ -1344,13 +1629,50 @@ namespace ABBridges
             SetMessage($"{del.Count} station(s) deleted.", false);
         }
 
+        // ---- on the plan: click adds a section there, Shift + click deletes the nearest division / near-diaphragm one
+        // the equally divided part under x (between two fixed stations), or none
+        private (string key, double a, double b, int n, int auto)? PartAt(double x)
+        {
+            if (_set == null) return null;
+            foreach (var p in _set.Parts) if (x > p.a + 1e-6 && x < p.b - 1e-6) return p;
+            return null;
+        }
+
+        // Shift + click: the division nearest to x inside its part goes, the part is divided again equally
+        private Section DeletableAt(double x)
+        {
+            var p = PartAt(x);
+            if (p == null || p.Value.n <= 1) return null;
+            return _set.Sections.Where(s => s.Kind == SectionKind.Division && s.Station > p.Value.a && s.Station < p.Value.b)
+                                .OrderBy(s => Math.Abs(s.Station - x)).FirstOrDefault();
+        }
+
+        // click: one more equal part where you click (the sections of that part are spread again)
+        private void AddStationAt(double x) => ChangeParts(x, +1);
+        private void DeleteStationNear(double x) => ChangeParts(x, -1);
+
+        private void ChangeParts(double x, int d)
+        {
+            var p = PartAt(x);
+            if (p == null) { SetMessage("Click between two sections of a span (not on a diaphragm, internal diaphragm or joint pair).", true); return; }
+            int n = p.Value.n + d;
+            if (n < 1) { SetMessage("This part has no section in it to take away.", true); return; }
+            int extra = n - p.Value.auto;
+            if (extra == 0) BridgeSettings.DivExtra.Remove(p.Value.key); else BridgeSettings.DivExtra[p.Value.key] = extra;
+            EnsureStations(true);
+            double gap = (p.Value.b - p.Value.a) / n;
+            string over = gap > BridgeSettings.Spacing + 1e-6 ? $"  (more than Max spacing {BridgeSettings.Spacing:0.00})" : "";
+            SetMessage($"{Fmt.Chainage(p.Value.a)} → {Fmt.Chainage(p.Value.b)}: {n} equal parts of {gap:0.000} m{over}.", over.Length > 0);
+        }
+
         private void ResetStations()
         {
-            if (_set != null && _set.Sections.Any(s => s.Edited))
+            if (_set != null && (_set.Sections.Any(s => s.Edited) || BridgeSettings.DivExtra.Count > 0))
             {
-                if (MessageBox.Show(this, "Generate the stations again and lose the manual edits?", "AB Bridges",
+                if (MessageBox.Show(this, "Divide every part again from Max spacing and lose the parts you added / took away?", "AB Bridges",
                                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             }
+            BridgeSettings.DivExtra.Clear();          // back to the parts from Max spacing
             EnsureStations(true);
         }
 

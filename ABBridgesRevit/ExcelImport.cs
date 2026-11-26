@@ -1,4 +1,4 @@
-// AB Bridges - Import Excel / Update Excel
+﻿// AB Bridges - Import Excel / Update Excel
 // Import: opens the workbook in Excel (sheet "To Revit"), the user selects the tables (Ctrl for more than one),
 // Done -> every selected area becomes a black and white table (lines + text) in its own drafting view (1:1),
 // optionally placed on a sheet. Update: reads every stored file / sheet / range again and redraws it in place.
@@ -16,6 +16,7 @@ using Autodesk.Revit.DB;
 using UI = Autodesk.Revit.UI;
 using Form = System.Windows.Forms.Form;
 using Point = System.Drawing.Point;
+using View = Autodesk.Revit.DB.View;
 using RColor = Autodesk.Revit.DB.Color;
 using WinColor = System.Drawing.Color;
 
@@ -106,6 +107,21 @@ namespace ABBridgesRevit
             using (var f = new NamesForm(tables, sheets))
             {
                 if (f.ShowDialog() != DialogResult.OK) return UI.Result.Cancelled;
+                // first every table as a Detail Item family (made and loaded outside the project transaction)
+                var app = data.Application.Application;
+                var fams = new Dictionary<XlTable, Family>();
+                var names = new Dictionary<XlTable, string>();
+                var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var flog = new List<string>();
+                foreach (XlTable tb in tables)
+                {
+                    string vn = Unique(doc, tb.Name);
+                    string k0 = vn; int k = 2;
+                    while (!usedNames.Add(vn)) vn = k0 + " (" + k++ + ")";
+                    names[tb] = vn;
+                    try { fams[tb] = BuildFamily(app, doc, tb, f.TextMm, FamilyName(vn)); }
+                    catch (Exception ex) { flog.Add($"{vn}: family not made ({ex.Message}) - drawn as lines + text"); }
+                }
                 using (var tr = new Transaction(doc, "AB Import Excel"))
                 {
                     tr.Start();
@@ -117,11 +133,12 @@ namespace ABBridgesRevit
                     {
                         ViewDrafting v = ViewDrafting.Create(doc, vft.Id);
                         v.Scale = 1;
-                        v.Name = Unique(doc, tb.Name);
-                        List<ElementId> ids = Draw(doc, v, tb, f.TextMm);
+                        v.Name = names[tb];
+                        List<ElementId> ids = fams.TryGetValue(tb, out Family fam) && fam != null ? Place(doc, v, fam) : Draw(doc, v, tb, f.TextMm);
                         string vid = v.Id.Value.ToString(CI);
                         map[Key + vid] = string.Join("|", tb.File, tb.Sheet, tb.Address, f.TextMm.ToString(CI));
                         map[IdsKey + vid] = AbStore.Ids(ids);
+                        if (fam != null) map[FamKey + vid] = fam.Name;
                         if (sh != null && Viewport.CanAddViewToSheet(doc, sh.Id, v.Id))
                         {
                             BoundingBoxUV o = sh.Outline;
@@ -135,7 +152,8 @@ namespace ABBridgesRevit
                     AbStore.Save(doc, map);
                     tr.Commit();
                 }
-                UI.TaskDialog.Show("AB Bridges", $"{tables.Count} table(s) imported" + (f.SheetIndex > 0 ? " and placed on the sheet." : "."));
+                UI.TaskDialog.Show("AB Bridges", $"{tables.Count} table(s) imported as Detail Item families (AB Table - ...)" + (f.SheetIndex > 0 ? " and placed on the sheet." : ".") +
+                                                 (flog.Count > 0 ? "\n\n" + string.Join("\n", flog) : ""));
             }
             return UI.Result.Succeeded;
         }
@@ -158,35 +176,54 @@ namespace ABBridgesRevit
                 xl = Activator.CreateInstance(t);
                 xl.Visible = false; xl.DisplayAlerts = false;
                 var books = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
+                var app = data.Application.Application;
+                // 1. read every table again, 2. its family made again and reloaded (every copy follows) - no transaction open,
+                // 3. the old loose lines / texts (tables imported before the families) become one copy of the family
+                var work = new List<(string vid, View v, XlTable tb, double mm, Family fam)>();
+                foreach (var kv in items)
+                {
+                    string vid = kv.Key.Substring(Key.Length);
+                    View v = long.TryParse(vid, out long l) ? doc.GetElement(new ElementId(l)) as View : null;
+                    if (v == null) { map.Remove(kv.Key); map.Remove(IdsKey + vid); map.Remove(FamKey + vid); continue; }
+                    string[] p = kv.Value.Split('|');
+                    if (p.Length < 4) continue;
+                    if (!File.Exists(p[0])) { log.Add($"{v.Name}: file not found ({p[0]})."); continue; }
+                    try
+                    {
+                        if (!books.TryGetValue(p[0], out dynamic wb)) { wb = xl.Workbooks.Open(p[0], 0, true); books[p[0]] = wb; }
+                        dynamic area = wb.Worksheets[p[1]].Range[p[2]];
+                        XlTable tb = Read(area, p[0], p[1]);
+                        if (tb == null) continue;
+                        double mm = double.TryParse(p[3], NumberStyles.Float, CI, out double m) ? m : 2.5;
+                        string fname = map.TryGetValue(FamKey + vid, out string fn0) ? fn0 : FamilyName(v.Name);
+                        Family fam = null;
+                        try { fam = BuildFamily(app, doc, tb, mm, fname); }
+                        catch (Exception ex) { log.Add($"{v.Name}: family not made ({ex.Message}) - drawn as lines + text"); }
+                        work.Add((vid, v, tb, mm, fam));
+                    }
+                    catch (Exception ex) { log.Add($"{v.Name}: {ex.Message}"); }
+                }
+                foreach (dynamic wb in books.Values) { try { wb.Close(false); } catch { } }
                 using (var tr = new Transaction(doc, "AB Update Excel"))
                 {
                     tr.Start();
-                    foreach (var kv in items)
+                    foreach (var w in work)
                     {
-                        string vid = kv.Key.Substring(Key.Length);
-                        View v = long.TryParse(vid, out long l) ? doc.GetElement(new ElementId(l)) as View : null;
-                        if (v == null) { map.Remove(kv.Key); map.Remove(IdsKey + vid); continue; }
-                        string[] p = kv.Value.Split('|');
-                        if (p.Length < 4) continue;
-                        if (!File.Exists(p[0])) { log.Add($"{v.Name}: file not found ({p[0]})."); continue; }
                         try
                         {
-                            if (!books.TryGetValue(p[0], out dynamic wb)) { wb = xl.Workbooks.Open(p[0], 0, true); books[p[0]] = wb; }
-                            dynamic area = wb.Worksheets[p[1]].Range[p[2]];
-                            XlTable tb = Read(area, p[0], p[1]);
-                            if (tb == null) continue;
-                            if (map.TryGetValue(IdsKey + vid, out string old))
-                                foreach (ElementId id in AbStore.Ids(old)) { try { doc.Delete(id); } catch { } }
-                            double mm = double.TryParse(p[3], NumberStyles.Float, CI, out double m) ? m : 2.5;
-                            map[IdsKey + vid] = AbStore.Ids(Draw(doc, v, tb, mm));
+                            var oldIds = map.TryGetValue(IdsKey + w.vid, out string old) ? AbStore.Ids(old) : new List<ElementId>();
+                            bool haveCopy = w.fam != null && oldIds.Any(id => doc.GetElement(id) is FamilyInstance fi && fi.Symbol?.Family?.Id == w.fam.Id);
+                            if (haveCopy) { map[FamKey + w.vid] = w.fam.Name; done++; continue; }     // the reload already changed it
+                            foreach (ElementId id in oldIds) { try { doc.Delete(id); } catch { } }
+                            map[IdsKey + w.vid] = AbStore.Ids(w.fam != null ? Place(doc, w.v, w.fam) : Draw(doc, w.v, w.tb, w.mm));
+                            if (w.fam != null) map[FamKey + w.vid] = w.fam.Name;
                             done++;
                         }
-                        catch (Exception ex) { log.Add($"{v.Name}: {ex.Message}"); }
+                        catch (Exception ex) { log.Add($"{w.v.Name}: {ex.Message}"); }
                     }
                     AbStore.Save(doc, map);
                     tr.Commit();
                 }
-                foreach (dynamic wb in books.Values) { try { wb.Close(false); } catch { } }
             }
             finally
             {
@@ -251,11 +288,71 @@ namespace ABBridgesRevit
             return tb;
         }
 
+        // ---------------------------------------------------------------- the table as a Detail Item family
+        private const string FamKey = "XLS|F|";        // view id -> family name
+
+        private static string DetailTemplate(Autodesk.Revit.ApplicationServices.Application app)
+        {
+            try
+            {
+                string root = app.FamilyTemplatePath;
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) return null;
+                var files = Directory.GetFiles(root, "*.rft", SearchOption.AllDirectories);
+                return files.FirstOrDefault(f => Path.GetFileName(f).Equals("Metric Detail Item.rft", StringComparison.OrdinalIgnoreCase))
+                    ?? files.FirstOrDefault(f => Path.GetFileName(f).IndexOf("Detail Item", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                                                 Path.GetFileName(f).IndexOf("Line Based", StringComparison.OrdinalIgnoreCase) < 0);
+            }
+            catch { return null; }
+        }
+
+        // makes (or makes again) the family "name" with the table drawn in it and loads it into the project (overwriting:
+        // every placed copy follows). Must run with no transaction open in the project.
+        private static Family BuildFamily(Autodesk.Revit.ApplicationServices.Application app, Document doc, XlTable tb, double textMm, string name)
+        {
+            string tpl = DetailTemplate(app) ?? throw new InvalidOperationException("the Detail Item family template (Metric Detail Item.rft) was not found");
+            Document fdoc = app.NewFamilyDocument(tpl);
+            string dir = Path.Combine(Path.GetTempPath(), "AB Bridges tables");
+            Directory.CreateDirectory(dir);
+            string file = Path.Combine(dir, name + ".rfa");
+            try
+            {
+                using (var t = new Transaction(fdoc, "table"))
+                {
+                    t.Start();
+                    View fv = new FilteredElementCollector(fdoc).OfClass(typeof(ViewPlan)).Cast<View>().FirstOrDefault(x => !x.IsTemplate)
+                              ?? new FilteredElementCollector(fdoc).OfClass(typeof(View)).Cast<View>().First(x => !x.IsTemplate && x.ViewType != ViewType.ProjectBrowser);
+                    Draw(fdoc, fv, tb, textMm);
+                    t.Commit();
+                }
+                fdoc.SaveAs(file, new SaveAsOptions { OverwriteExistingFile = true });
+                return fdoc.LoadFamily(doc, new DeckBuilder.LoadOpts());
+            }
+            finally { try { fdoc.Close(false); } catch { } }
+        }
+
+        private static string FamilyName(string viewName)
+        {
+            string n = "AB Table - " + viewName;
+            foreach (char ch in Path.GetInvalidFileNameChars()) n = n.Replace(ch, '-');
+            return n;
+        }
+
+        // one copy of the family in the view, at its origin
+        private static List<ElementId> Place(Document doc, View v, Family fam)
+        {
+            FamilySymbol sym = fam.GetFamilySymbolIds().Select(id => doc.GetElement(id) as FamilySymbol).FirstOrDefault(x => x != null);
+            if (sym == null) return new List<ElementId>();
+            if (!sym.IsActive) sym.Activate();
+            FamilyInstance fi = doc.Create.NewFamilyInstance(XYZ.Zero, sym, v);
+            return new List<ElementId> { fi.Id };
+        }
+
         // ---------------------------------------------------------------- draw (view 1:1, sizes in paper mm)
         private static List<ElementId> Draw(Document doc, View v, XlTable tb, double textMm)
         {
             var ids = new List<ElementId>();
-            GraphicsStyle thin = SubstructureCommand.LineStyle(doc, "AB Table", new RColor(0, 0, 0));
+            GraphicsStyle thin = null;
+            try { thin = SubstructureCommand.LineStyle(doc, "AB Table", new RColor(0, 0, 0)); } catch { }
             ElementId tn = TextType(doc, textMm, false), tbd = TextType(doc, textMm, true);
             double[] xs = new double[tb.Cols + 1], ys = new double[tb.Rows + 1];
             for (int c = 0; c < tb.Cols; c++) xs[c + 1] = xs[c] + tb.ColW[c];
@@ -266,10 +363,11 @@ namespace ABBridgesRevit
             for (int r = 0; r < tb.Rows; r++) for (int c = 0; c < tb.Cols; c++) own[r, c] = (r, c);
             foreach (var m in tb.Merges) for (int r = m.r1; r <= m.r2; r++) for (int c = m.c1; c <= m.c2; c++) own[r, c] = (m.r1, m.c1);
 
+            Autodesk.Revit.Creation.ItemFactoryBase fac = doc.IsFamilyDocument ? (Autodesk.Revit.Creation.ItemFactoryBase)doc.FamilyCreate : doc.Create;     // the table is drawn in a family too
             void Ln(double x1, double y1, double x2, double y2)
             {
                 if (Math.Abs(x1 - x2) + Math.Abs(y1 - y2) < 1e-6) return;
-                try { DetailCurve dc = doc.Create.NewDetailCurve(v, Line.CreateBound(new XYZ(Mm(x1), Mm(y1), 0), new XYZ(Mm(x2), Mm(y2), 0))); if (thin != null) dc.LineStyle = thin; ids.Add(dc.Id); } catch { }
+                try { DetailCurve dc = fac.NewDetailCurve(v, Line.CreateBound(new XYZ(Mm(x1), Mm(y1), 0), new XYZ(Mm(x2), Mm(y2), 0))); if (thin != null) dc.LineStyle = thin; ids.Add(dc.Id); } catch { }
             }
             // horizontal lines, joined in runs; skipped inside a merge
             for (int r = 0; r <= tb.Rows; r++)
@@ -377,7 +475,7 @@ namespace ABBridgesRevit
             {
                 Text = "AB Bridges - Import Excel"; TopMost = true; FormBorderStyle = FormBorderStyle.FixedToolWindow;
                 StartPosition = FormStartPosition.Manual; ClientSize = new Size(330, 92); Font = new Font("Segoe UI", 9f);
-                Rectangle wa = Screen.PrimaryScreen.WorkingArea; Location = new Point(wa.Right - Width - 20, wa.Top + 120);
+                System.Drawing.Rectangle wa =Screen.PrimaryScreen.WorkingArea; Location = new Point(wa.Right - Width - 20, wa.Top + 120);
                 Controls.Add(new Label { Text = "Select the tables in Excel (hold Ctrl for more than one), then press Done.", Location = new Point(10, 8), Size = new Size(310, 36) });
                 var ok = new Button { Text = "Done", Location = new Point(150, 52), Size = new Size(80, 28), DialogResult = DialogResult.OK, BackColor = WinColor.FromArgb(232, 121, 43), ForeColor = WinColor.White, FlatStyle = FlatStyle.Flat };
                 var no = new Button { Text = "Cancel", Location = new Point(238, 52), Size = new Size(80, 28), DialogResult = DialogResult.Cancel };

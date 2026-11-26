@@ -1,0 +1,56 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    AB Bridges - Civil 3D 2025 add-in ("AB Bridges" ribbon tab: Extract Data, PL. Start)
+    Build (Civil 3D closed):  dotnet build -c Release
+    The build installs the add-in to
+      %APPDATA%\Autodesk\ApplicationPlugins\ABBridges.bundle
+    and removes the old BridgePoints.bundle, so Civil 3D loads only the new one.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AssemblyName>ABBridges</AssemblyName>
+    <RootNamespace>ABBridges</RootNamespace>
+    <Version>2.0.0</Version>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <Civil3DPath>C:\Program Files\Autodesk\AutoCAD 2025</Civil3DPath>
+    <NoWarn>$(NoWarn);MSB3277;CA1416</NoWarn>
+    <BundleDir>$(APPDATA)\Autodesk\ApplicationPlugins\ABBridges.bundle</BundleDir>
+    <OldBundleDir>$(APPDATA)\Autodesk\ApplicationPlugins\BridgePoints.bundle</OldBundleDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="accoremgd"><HintPath>$(Civil3DPath)\accoremgd.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="acdbmgd"><HintPath>$(Civil3DPath)\acdbmgd.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="acmgd"><HintPath>$(Civil3DPath)\acmgd.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="AdWindows"><HintPath>$(Civil3DPath)\AdWindows.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="AeccDbMgd"><HintPath>$(Civil3DPath)\C3D\AeccDbMgd.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="AecBaseMgd"><HintPath>$(Civil3DPath)\ACA\AecBaseMgd.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\icon_F.png" />
+    <EmbeddedResource Include="Resources\icon_PL.png" />
+    <EmbeddedResource Include="Resources\icon_BP.png" />
+    <EmbeddedResource Include="AB_logo_256.png" />
+    <EmbeddedResource Include="AB.ico" />
+    <None Update="PackageContents.xml" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- install into the ApplicationPlugins bundle (auto-load). Close Civil 3D before building. -->
+  <Target Name="DeployBundle" AfterTargets="Build">
+    <RemoveDir Directories="$(OldBundleDir)" ContinueOnError="true" />
+    <Copy SourceFiles="PackageContents.xml" DestinationFolder="$(BundleDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetPath);$(TargetDir)$(TargetName).deps.json" DestinationFolder="$(BundleDir)\Contents" ContinueOnError="true" />
+    <Message Importance="high" Text="AB Bridges installed to $(BundleDir)" />
+  </Target>
+
+</Project>

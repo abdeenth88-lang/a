@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>AB Bridges</Name>
+    <Assembly>ABBridges\ABBridgesRevit.dll</Assembly>
+    <AddInId>6D2B8F14-3C7A-4E91-9B0D-2A5C4E7F1B83</AddInId>
+    <FullClassName>ABBridgesRevit.App</FullClassName>
+    <VendorId>ABDEEN</VendorId>
+    <VendorDescription>Abdeen - AB Bridges</VendorDescription>
+  </AddIn>
+</RevitAddIns>

@@ -74,20 +74,51 @@ namespace ABBridgesRevit
         public Func<BridgeExcel, LongData> LongOf;          // the longitudinal cut of the bridge (Revit side)
         private System.Windows.Forms.Timer _auto;                                // places the axis by itself after a change (no Apply button)
 
-        private void RefreshLong()
+        // the longitudinal view: the Excel part at once, the Revit cut (slow) once after the window is drawn, then kept
+        // per Excel file (path + time). modelChanged = families were placed: cut again.
+        private readonly Dictionary<string, LongData> _longCache = new Dictionary<string, LongData>(StringComparer.OrdinalIgnoreCase);
+        private string _longPending;
+
+        private string LongKey()
         {
-            if (_long == null) return;
-            try { _long.Data = LongOf != null && Excel != null ? LongOf(Excel) : null; }
-            catch (Exception ex) { _long.Data = null; _long.Message = "The bridge view could not be drawn: " + ex.Message; }
-            _long.Invalidate();
+            string p = _tb?.Text.Trim() ?? "";
+            try { return p + "|" + File.GetLastWriteTimeUtc(p).Ticks; } catch { return p; }
         }
 
-        private void SnapLater()
+        private void RefreshLong(bool modelChanged = false)
         {
-            var t = new System.Windows.Forms.Timer { Interval = 600 };
-            t.Tick += (s, e) => { t.Stop(); t.Dispose(); UiTheme.Snap(this, "Revit Substructure " + (CurAxis?.Name ?? "")); };
-            t.Start();
+            if (_long == null) return;
+            if (LongOf == null || Excel == null) { _long.Data = null; _long.Invalidate(); return; }
+            string key = LongKey();
+            if (modelChanged) _longCache.Clear();
+            if (_longCache.TryGetValue(key, out LongData hit)) { _long.Data = hit; _long.Invalidate(); return; }
+            if (_longPending == key) return;                       // already on its way
+            try { _long.Data = LongData.FromExcel(Excel); } catch { _long.Data = null; }
+            _long.Message = "Reading the bridge from Revit...";
+            _long.Invalidate();
+            _longPending = key;
+            BridgeExcel bx = Excel;
+            Action cut = () =>
+            {
+                if (_longPending != key || IsDisposed) return;
+                Cursor old = Cursor.Current;
+                Cursor.Current = Cursors.WaitCursor;
+                try
+                {
+                    LongData d = LongOf(bx);
+                    _longCache[key] = d;
+                    if (Excel == bx) _long.Data = d;
+                }
+                catch (Exception ex) { _long.Message = "The bridge view could not be drawn: " + ex.Message; }
+                finally { _longPending = null; Cursor.Current = old; }
+                _long.Invalidate();
+                SnapLater();
+            };
+            if (IsHandleCreated) BeginInvoke(cut); else cut();
         }
+
+        // (no window pictures here: drawing the window to a picture made the Revit preview flicker and reload)
+        private void SnapLater() { }
         private readonly CheckBox _create;
         private readonly ComboBox _copyFrom;
         private readonly DataGridView _grid, _params;
@@ -389,9 +420,10 @@ namespace ABBridgesRevit
                 _depth = Box(0.01m, 500m, 0.5m, 0.01m);
                 _cropW = Box(1m, 2000m, 1m, 30m);
                 _cropH = Box(1m, 2000m, 1m, 20m);
-                _depth.ValueChanged += (s, e) => SetSize(0);
-                _cropW.ValueChanged += (s, e) => SetSize(1);
-                _cropH.ValueChanged += (s, e) => SetSize(2);
+                // the section is made again once, half a second after the last change (not on every arrow click)
+                _depth.ValueChanged += (s, e) => SizeLater(0);
+                _cropW.ValueChanged += (s, e) => SizeLater(1);
+                _cropH.ValueChanged += (s, e) => SizeLater(2);
                 bar2.Controls.Add(Lbl("Depth (m)"));
                 bar2.Controls.Add(_depth);
                 bar2.Controls.Add(Lbl("Crop width (m)"));
@@ -429,10 +461,10 @@ namespace ABBridgesRevit
                 _view.BackColor = Color.FromArgb(248, 250, 252);
             }
             Controls.Add(_view);
-            Button apply = Flat("Apply this axis", new Point(962, 648), 130, true);
+            Button apply = Flat("Apply", new Point(962, 648), 120, true);
             apply.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
-            apply.Visible = false;                  // no Apply: every change is placed by itself (see Changed)
-            apply.Click += (s, e) => ApplyNow();
+            apply.Click += (s, e) => ApplyNow();    // places the families of this axis and shows them in the section
+            _applyBtn = apply;
             Controls.Add(apply);
             FormClosing += (s, e) =>
             {
@@ -479,24 +511,15 @@ namespace ABBridgesRevit
             Controls.AddRange(new Control[] { create, save, close });
             _createBtn = create; _saveBtn = save; _closeBtn = close;
             Resize += (s, e) => { Relayout(); LayoutParams(); };
-            // ---- header, longitudinal view, the axis cards; the big section lives in its own window (double-click a card)
+            // ---- header; the axis chips on top; left: families + parameters; right: the live section of the open axis
             foreach (Control c in Controls.Cast<Control>().ToList()) c.Anchor = AnchorStyles.Top | AnchorStyles.Left;   // all placed by LayoutAll
             Controls.Add(new BrandHeader("Substructure"));
             Brand.SetIcon(this);
-            _long = new LongView();
-            _long.AxisClicked += n => { if (Excel == null) return; int k = Excel.Axes.FindIndex(x => x.Name == n); if (k >= 0) _tabs.SelectedIndex = k; };
-            Controls.Add(_long);
-            _cardsPanel = new Panel { BackColor = Color.White };
-            Controls.Add(_cardsPanel);
-            Controls.Remove(_view);
-            _view.Dock = DockStyle.Fill;
-            _view.BorderStyle = BorderStyle.None;
-            _tabs.Visible = false;                    // the cards / bubbles choose the axis; the tabs only keep the selection
+            _view.BorderStyle = BorderStyle.FixedSingle;
+            _tabs.Visible = true;                     // the axis chips: click one or use ← / → (a hidden TabControl does not change axis)
             _viewNote.Visible = false;
-            _tabs.SelectedIndexChanged += (s2, e2) => MarkCards();
-            FormClosing += (s2, e2) => { try { _big?.Close(); } catch { } DropCards(); };
             UiTheme.StyleTabs(_tabs);
-            _tabs.SelectedIndexChanged += (s2, e2) => SnapLater();
+            _tabs.SelectedIndexChanged += (s2, e2) => SnapLater();      // ShowAxis shows the section of the new axis
 
             Load += (s, e) =>
             {
@@ -517,8 +540,7 @@ namespace ABBridgesRevit
             Shown += (s, e) =>
             {
                 if (File.Exists(_tb.Text.Trim())) LoadExcel();
-                else { _status.ForeColor = Grey; _status.Text = "Choose the bridge Excel (sheet Substructure)."; }
-                RefreshLong();
+                else { _status.ForeColor = Grey; _status.Text = "Choose the bridge Excel (sheet Substructure)."; RefreshLong(); }
                 SnapLater();
                 if (StartRow >= 0 && Cur != null && StartRow < Cur.Rows.Count) FillGrid(StartRow);
                 if (!string.IsNullOrEmpty(Note))
@@ -590,7 +612,6 @@ namespace ABBridgesRevit
             _status.ForeColor = Green;
             _status.Text = $"✓ {Excel.BridgeName} · {Excel.Axes.Count} axes · sheet Substructure found";
             UpdateTabs();
-            RefreshLong();
             BuildCards();
             int start = string.IsNullOrEmpty(StartAxis) ? 0 : Math.Max(0, Excel.Axes.FindIndex(x => string.Equals(x.Name, StartAxis, StringComparison.OrdinalIgnoreCase)));
             _tabs.SelectedIndex = start;
@@ -644,6 +665,7 @@ namespace ABBridgesRevit
             }
             finally { _loading = false; }
             FillGrid(0);
+            ShowPending();
             ShowPreview(false);
         }
 
@@ -660,7 +682,7 @@ namespace ABBridgesRevit
 
         private void ShowPreview(bool force)
         {
-            if (_previewOf == null || _big == null) return;     // the cards show the sections; the big one only in its window
+            if (_previewOf == null) return;
             AxisData a = CurAxis;
             if (a == null) { DropPreview(); _secHead.Text = ""; return; }
             if (!force && _preview != null && _previewAxis == a.Name + "|" + _mode) return;
@@ -738,6 +760,7 @@ namespace ABBridgesRevit
             _shot.Visible = true;
             _shot.BringToFront();
             _m1 = _m2 = _mh = null;
+            _snapEnd = null;                 // the snap lists are made again for this section
             _measureText.Text = "Measure: click two points (they snap to corners and edges; right click = clear).  Measure again to go back to the section.";
         }
 
@@ -766,21 +789,48 @@ namespace ABBridgesRevit
             return new PointF(c.X, c.Y);
         }
 
-        // the nearest corner within 12 px, else the nearest point on an edge within 8 px, else the point itself
+        // every snap: Endpoint, Intersection, Midpoint (within 12 px, in that order of preference), else Nearest on an edge (8 px)
+        private string _mhKind = "";
+        private List<(double x, double y)> _snapEnd, _snapMid, _snapInt;
+
+        private void BuildSnapLists()
+        {
+            _snapEnd = new List<(double x, double y)>(); _snapMid = new List<(double x, double y)>(); _snapInt = new List<(double x, double y)>();
+            if (!(_preview is IMeasurable pm)) return;
+            _snapEnd.AddRange(pm.SnapPoints);
+            var segs = pm.SnapSegments.ToList();
+            foreach (var s in segs) { _snapEnd.Add(s.a); _snapEnd.Add(s.b); _snapMid.Add(((s.a.x + s.b.x) / 2, (s.a.y + s.b.y) / 2)); }
+            int n = Math.Min(segs.Count, 1500);
+            for (int i = 0; i < n; i++)
+                for (int j = i + 1; j < n; j++)
+                {
+                    var (a, b) = segs[i]; var (c, d) = segs[j];
+                    double rx = b.x - a.x, ry = b.y - a.y, sx = d.x - c.x, sy = d.y - c.y, den = rx * sy - ry * sx;
+                    if (Math.Abs(den) < 1e-12) continue;
+                    double t = ((c.x - a.x) * sy - (c.y - a.y) * sx) / den, u = ((c.x - a.x) * ry - (c.y - a.y) * rx) / den;
+                    if (t > 1e-6 && t < 1 - 1e-6 && u > 1e-6 && u < 1 - 1e-6) _snapInt.Add((a.x + rx * t, a.y + ry * t));
+                }
+        }
+
         private (double x, double y) ShotSnap(Point p, out bool snapped)
         {
             snapped = false;
+            _mhKind = "";
             var res = ToView(p);
             if (!(_preview is IMeasurable pm)) return res;
-            double best = 12;
-            foreach (var q in pm.SnapPoints)
+            if (_snapEnd == null) BuildSnapLists();
+            foreach (var (kind, list) in new[] { ("Endpoint", _snapEnd), ("Intersection", _snapInt), ("Midpoint", _snapMid) })
             {
-                PointF c = ToClient(q);
-                double d = Math.Sqrt((c.X - p.X) * (c.X - p.X) + (c.Y - p.Y) * (c.Y - p.Y));
-                if (d < best) { best = d; res = q; snapped = true; }
+                double best = 12;
+                foreach (var q in list)
+                {
+                    PointF c = ToClient(q);
+                    double d = Math.Sqrt((c.X - p.X) * (c.X - p.X) + (c.Y - p.Y) * (c.Y - p.Y));
+                    if (d < best) { best = d; res = q; snapped = true; }
+                }
+                if (snapped) { _mhKind = kind; return res; }
             }
-            if (snapped) return res;
-            best = 8;
+            double bestE = 8;
             foreach (var sg in pm.SnapSegments)
             {
                 PointF a = ToClient(sg.a), b = ToClient(sg.b);
@@ -789,9 +839,25 @@ namespace ABBridgesRevit
                 double t = Math.Max(0, Math.Min(1, ((p.X - a.X) * vx + (p.Y - a.Y) * vy) / l2));
                 double cx = a.X + vx * t, cy = a.Y + vy * t;
                 double d = Math.Sqrt((cx - p.X) * (cx - p.X) + (cy - p.Y) * (cy - p.Y));
-                if (d < best) { best = d; res = (sg.a.x + (sg.b.x - sg.a.x) * t, sg.a.y + (sg.b.y - sg.a.y) * t); snapped = true; }
+                if (d < bestE) { bestE = d; res = (sg.a.x + (sg.b.x - sg.a.x) * t, sg.a.y + (sg.b.y - sg.a.y) * t); snapped = true; }
             }
+            if (snapped) _mhKind = "Nearest";
             return res;
+        }
+
+        // the AutoCAD-like snap marks: endpoint square, midpoint triangle, intersection X, nearest hourglass
+        private static void SnapMark(Graphics g, PointF h, string kind, Pen pen)
+        {
+            float r = 6;
+            switch (kind)
+            {
+                case "Endpoint": g.DrawRectangle(pen, h.X - r, h.Y - r, 2 * r, 2 * r); break;
+                case "Midpoint": g.DrawPolygon(pen, new[] { new PointF(h.X, h.Y - r), new PointF(h.X + r, h.Y + r), new PointF(h.X - r, h.Y + r) }); break;
+                case "Intersection": g.DrawLine(pen, h.X - r, h.Y - r, h.X + r, h.Y + r); g.DrawLine(pen, h.X - r, h.Y + r, h.X + r, h.Y - r); break;
+                case "Nearest":
+                    g.DrawPolygon(pen, new[] { new PointF(h.X - r, h.Y - r), new PointF(h.X + r, h.Y - r), new PointF(h.X - r, h.Y + r), new PointF(h.X + r, h.Y + r) }); break;
+                default: g.DrawEllipse(pen, h.X - 4, h.Y - 4, 8, 8); break;
+            }
         }
 
         private void ShotDown(object sender, MouseEventArgs e)
@@ -822,7 +888,11 @@ namespace ABBridgesRevit
                 if (_mh.HasValue)
                 {
                     PointF h = ToClient(_mh.Value);
-                    g.DrawRectangle(_mhSnapped ? green : ink, h.X - 5, h.Y - 5, 10, 10);
+                    SnapMark(g, h, _mhSnapped ? _mhKind : "", _mhSnapped ? green : ink);
+                    if (_mhSnapped && _mhKind.Length > 0)
+                        using (var f = new System.Drawing.Font("Segoe UI", 8f))
+                        using (var kb = new SolidBrush(Color.FromArgb(22, 120, 60)))
+                            g.DrawString(_mhKind, f, kb, h.X + 9, h.Y + 6);
                 }
                 if (_m1 == null) return;
                 PointF a = ToClient(_m1.Value);
@@ -844,6 +914,39 @@ namespace ABBridgesRevit
                     using (var br = new SolidBrush(Red)) g.DrawString(t, f, br, tx, ty);
                 }
             }
+        }
+
+        private System.Windows.Forms.Timer _sizeTimer;
+        private readonly HashSet<int> _sizeWhich = new HashSet<int>();
+        private void SizeLater(int which)
+        {
+            if (_loading || _sectionSize == null) return;
+            _sizeWhich.Add(which);
+            if (_sizeTimer == null)
+            {
+                _sizeTimer = new System.Windows.Forms.Timer { Interval = 500 };
+                _sizeTimer.Tick += (s, e) =>
+                {
+                    _sizeTimer.Stop();
+                    var w = _sizeWhich.ToList(); _sizeWhich.Clear();
+                    SetSizes(w);
+                };
+            }
+            _sizeTimer.Stop(); _sizeTimer.Start();
+        }
+
+        private void SetSizes(List<int> which)
+        {
+            if (_loading || _sectionSize == null || which.Count == 0) return;
+            AxisData a = CurAxis;
+            if (a == null) return;
+            var v = new[] { double.NaN, double.NaN, double.NaN };
+            if (which.Contains(0)) v[0] = (double)_depth.Value;
+            if (which.Contains(1)) v[1] = (double)_cropW.Value;
+            if (which.Contains(2)) v[2] = (double)_cropH.Value;
+            DropPreview();
+            try { _sectionSize(a, _mode, v); } catch (Exception ex) { _secHead.Text = "The section could not be changed: " + ex.Message; }
+            ShowPreview(true);
         }
 
         private void SetSize(int which)
@@ -868,7 +971,6 @@ namespace ABBridgesRevit
             if (_grid.IsCurrentCellInEditMode) _grid.EndEdit();
             if (_params.IsCurrentCellInEditMode) _params.EndEdit();
             if (!s.HasWork) { if (!quiet) MessageBox.Show(this, $"Choose the families of {a.Name} first.", "AB Bridges"); return; }
-            DropPreview();
             string report;
             Cursor old = Cursor.Current;
             Cursor.Current = Cursors.WaitCursor;
@@ -876,8 +978,11 @@ namespace ABBridgesRevit
             catch (Exception ex) { report = "Failed: " + ex.Message; }
             finally { Cursor.Current = old; }
             _sections.Remove(a.Name);
-            ShowPreview(true);
-            RefreshLong();
+            _pending.Remove(a.Name);
+            ShowPending();
+            // the open preview shows the new families by itself: it is not made again (that blinked and zoomed to fit)
+            ShowPreview(false);
+            QueueCard(a.Name, true);      // the picture of this card again
             if (!string.IsNullOrEmpty(report))
             {
                 bool problem = report.Contains("not placed") || report.Contains("no ") || report.StartsWith("Failed");
@@ -960,15 +1065,24 @@ namespace ABBridgesRevit
             Changed();
         }
 
+        // a change is kept and waits for Apply (nothing is placed while editing)
+        private readonly HashSet<string> _pending = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private Button _applyBtn;
+
         private void Changed()
         {
-            if (_applyAxis != null && !_loading)
-            {
-                if (_auto == null) { _auto = new System.Windows.Forms.Timer { Interval = 900 }; _auto.Tick += (s, e) => { _auto.Stop(); ApplyNow(true); }; }
-                _auto.Stop(); _auto.Start();
-            }
+            if (_applyAxis != null && !_loading && CurAxis != null) { _pending.Add(CurAxis.Name); ShowPending(); }
             UpdateTabs();
             _view.Invalidate();
+        }
+
+        private void ShowPending()
+        {
+            if (_applyBtn == null) return;
+            bool on = CurAxis != null && _pending.Contains(CurAxis.Name);
+            _applyBtn.Text = on ? "Apply  ●" : "Apply";
+            _applyBtn.BackColor = on ? Orange : Navy;
+            _applyBtn.FlatAppearance.BorderColor = on ? Orange : Navy;
         }
 
         private void MoveRow(int d)
@@ -1036,7 +1150,7 @@ namespace ABBridgesRevit
         // everything placed from the window size: Excel row, long view, the cards, the bottom strip, the bottom bar
         private void LayoutAll()
         {
-            if (_grid == null || _params == null || _long == null || _cardsPanel == null) return;
+            if (_grid == null || _params == null || _view == null) return;
             int W = ClientSize.Width, H = ClientSize.Height, m = 12;
             int y = BrandHeader.Height0 + 8;
             _xlLbl.Location = new Point(m, y + 4);
@@ -1045,26 +1159,27 @@ namespace ABBridgesRevit
             _status.SetBounds(_browse.Right + 12, y + 3, Math.Max(100, W - _browse.Right - 24), 20);
             y += 34;
 
-            const int bar = 52;
-            int strip = Math.Max(250, (int)((H - y - bar) * 0.36));
-            int avail = Math.Max(300, H - y - bar - strip - 12);
-            int longH = Math.Max(130, (int)(avail * 0.42));
-            int cardsH = avail - longH - 6;
-            _long.SetBounds(m, y, W - 2 * m, longH);
-            y += longH + 6;
-            _cardsPanel.SetBounds(m, y, W - 2 * m, cardsH);
-            LayoutCards();
-            y += cardsH + 12;
+            // the axis chips
+            _tabs.SetBounds(m, y, W - 2 * m, 32);
+            y += 38;
 
-            // bottom strip: left the families of the axis, right the bearing settings + the parameters
-            int lw = (int)((W - 3 * m) * 0.52), rx = 2 * m + lw, rw = W - rx - m;
-            int top = y, bottom = H - bar - 8;
+            const int bar = 52;
+            int bottom = H - bar - 8;
+            // left: families (top) + bearing / abutment settings and parameters (under); right: the section.
+            // Both shares come from the two drag bars (kept for the next time)
+            EnsureSplitBars();
+            int lw = Math.Max(600, Math.Min(W - 3 * m - 260, (int)((W - 3 * m) * s_leftShare))), vx = 2 * m + lw, vw = Math.Max(200, W - vx - m);   // 600: the buttons and the "Create / Copy" row fit
+            _view.SetBounds(vx, y, vw, Math.Max(200, bottom - y));
+            _vBar.SetBounds(m + lw + 2, y, m - 4, Math.Max(200, bottom - y));
+            int top = y, famH = Math.Max(150, Math.Min(bottom - top - 150, (int)((bottom - top) * s_famShare)));
+            _hBar.SetBounds(m, top + famH + 1, lw, 6);
+            int rx = m, rw = lw;
             _famHead.SetBounds(m, top + 2, Math.Max(120, lw - 420), 18);
             _copyBtn.Location = new Point(m + lw - _copyBtn.Width, top - 2);
             _copyFrom.Location = new Point(_copyBtn.Left - 8 - _copyFrom.Width, top + 1);
             _copyLbl.Location = new Point(_copyFrom.Left - 6 - _copyLbl.PreferredWidth, top + 4);
             _create.Location = new Point(_copyLbl.Left - 18 - _create.PreferredSize.Width, top + 2);
-            int by = bottom - 30;
+            int by = top + famH - 30;
             _grid.SetBounds(m, top + 26, lw, Math.Max(80, by - top - 32));
             _addBtn.Location = new Point(m, by); _upBtn.Location = new Point(_addBtn.Right + 6, by); _downBtn.Location = new Point(_upBtn.Right + 4, by);
             _removeBtn.Location = new Point(_downBtn.Right + 6, by); _loadBtn.Location = new Point(_removeBtn.Right + 8, by);
@@ -1073,8 +1188,9 @@ namespace ABBridgesRevit
             int fixedCols = _grid.Columns["No"].Width + _grid.Columns["Pick"].Width + _grid.Columns["Surf"].Width + _grid.Columns["V"].Width + _grid.Columns["H"].Width + _grid.Columns["PickH"].Width + 4;
             _grid.Columns["Fam"].Width = Math.Max(150, lw - fixedCols - SystemInformation.VerticalScrollBarWidth);
 
-            _detHead.SetBounds(rx, top + 2, rw, 18);
-            int py = top + 26;
+            int dtop = top + famH + 8;
+            _detHead.SetBounds(rx, dtop + 2, rw, 18);
+            int py = dtop + 26;
             foreach (Panel pn in new[] { _bear, _abutPanel, _repPanel }) pn.SetBounds(rx, py, rw, pn.Height);
             int ph = _bearOn ? _bear.Height + 6 : _abutOn ? _abutPanel.Height + 6 : _repOn ? _repPanel.Height + 6 : 0;
             _params.SetBounds(rx, py + ph, rw, Math.Max(80, bottom - py - ph));
@@ -1090,8 +1206,57 @@ namespace ABBridgesRevit
             _saveBtn.Location = new Point(_closeBtn.Left - 6 - _saveBtn.Width, yb);
             _createBtn.Location = new Point(_saveBtn.Left - 6 - _createBtn.Width, yb);
             _see.Location = new Point(_createBtn.Left - 6 - _see.Width, yb);
-            _summary.SetBounds(_next.Right + 12, yb + 7, Math.Max(100, _see.Left - _next.Right - 24), 20);
+            if (_applyBtn != null) { _applyBtn.Location = new Point(_see.Left - 6 - _applyBtn.Width, yb); _applyBtn.BringToFront(); }
+            int sumRight = _applyBtn != null ? _applyBtn.Left : _see.Left;
+            _summary.SetBounds(_next.Right + 12, yb + 7, Math.Max(100, sumRight - _next.Right - 24), 20);
         }
+
+        // ---- the drag bars: left | section, families / parameters
+        private static double s_leftShare = 0.46, s_famShare = 0.5;
+        private Panel _vBar, _hBar;
+
+        private void EnsureSplitBars()
+        {
+            if (_vBar != null) return;
+            Panel Bar(Cursor c)
+            {
+                var p = new Panel { BackColor = Color.FromArgb(226, 232, 240), Cursor = c };
+                p.Paint += (s, e) =>
+                {
+                    using (var b = new SolidBrush(Color.FromArgb(140, 150, 165)))
+                        for (int i = -2; i <= 2; i++)
+                            if (c == Cursors.VSplit) e.Graphics.FillEllipse(b, p.Width / 2f - 1.5f, p.Height / 2f + i * 8 - 1.5f, 3, 3);
+                            else e.Graphics.FillEllipse(b, p.Width / 2f + i * 8 - 1.5f, p.Height / 2f - 1.5f, 3, 3);
+                };
+                Controls.Add(p);
+                p.BringToFront();
+                return p;
+            }
+            _vBar = Bar(Cursors.VSplit);
+            _hBar = Bar(Cursors.HSplit);
+            bool dragV = false, dragH = false;
+            _vBar.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { dragV = true; _vBar.Capture = true; } };
+            _vBar.MouseUp += (s, e) => { dragV = false; _vBar.Capture = false; };      // no fit: only the Fit button fits
+            _vBar.MouseMove += (s, e) =>
+            {
+                if (!dragV) return;
+                int x = PointToClient(_vBar.PointToScreen(e.Location)).X;
+                s_leftShare = Math.Max(0.2, Math.Min(0.8, (x - 12.0) / Math.Max(1, ClientSize.Width - 36)));
+                LayoutAll();
+            };
+            _hBar.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) { dragH = true; _hBar.Capture = true; } };
+            _hBar.MouseUp += (s, e) => { dragH = false; _hBar.Capture = false; };
+            _hBar.MouseMove += (s, e) =>
+            {
+                if (!dragH) return;
+                int y = PointToClient(_hBar.PointToScreen(e.Location)).Y;
+                int top = _grid.Top - 26, bottom = ClientSize.Height - 60;
+                s_famShare = Math.Max(0.2, Math.Min(0.8, (y - top) / (double)Math.Max(1, bottom - top)));
+                LayoutAll();
+            };
+        }
+
+        private void ZoomPreview() { try { if (_preview is IMeasurable m) m.ZoomFit(); } catch { } }
 
         // ---------------------------------------------------------------- the axis cards (real Revit section at every axis)
 
@@ -1123,6 +1288,7 @@ namespace ABBridgesRevit
 
         private void DropCards()
         {
+            _cardQueue.Clear();
             foreach (AxisCard c in _cards) { try { c.Preview?.Dispose(); c.Dispose(); } catch { } }
             _cards.Clear();
             _cardsPanel?.Controls.Clear();
@@ -1146,15 +1312,9 @@ namespace ABBridgesRevit
                     card.Head.Click += (s, e) => Sel(); card.List.Click += (s, e) => Sel(); card.Click += (s, e) => Sel();
                     card.Head.DoubleClick += (s, e) => { Sel(); OpenBig(); };
                     card.List.DoubleClick += (s, e) => { Sel(); OpenBig(); };
-                    if (_previewOf != null)
-                    {
-                        try
-                        {
-                            Control c = _previewOf(a, "section");
-                            if (c != null) { c.Dock = DockStyle.Fill; card.Host.Controls.Add(c); card.Preview = c; }
-                        }
-                        catch (Exception ex) { card.Host.Controls.Add(new Label { Dock = DockStyle.Fill, Text = "Section not shown: " + ex.Message, ForeColor = Grey, TextAlign = ContentAlignment.MiddleCenter }); }
-                    }
+                    var wait = new Label { Dock = DockStyle.Fill, Text = "…", ForeColor = Grey, TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand };
+                    wait.Click += (s, e) => Sel(); wait.DoubleClick += (s, e) => { Sel(); OpenBig(); };
+                    card.Host.Controls.Add(wait);
                     _cards.Add(card);
                     _cardsPanel.Controls.Add(card);
                 }
@@ -1162,6 +1322,65 @@ namespace ABBridgesRevit
             finally { Cursor.Current = old; }
             RefreshCards();
             LayoutCards();
+            // the pictures: the current axis first, then the others, one at a time while the dialog is idle
+            _cardQueue.Clear();
+            string cur = CurAxis?.Name;
+            if (cur != null) _cardQueue.Add(cur);
+            foreach (AxisCard c in _cards) if (c.Axis != cur) _cardQueue.Add(c.Axis);
+            StartCardTimer();
+        }
+
+        private readonly List<string> _cardQueue = new List<string>();
+        private System.Windows.Forms.Timer _cardTimer;
+
+        private void QueueCard(string axis, bool first)
+        {
+            _cardQueue.Remove(axis);
+            if (first) _cardQueue.Insert(0, axis); else _cardQueue.Add(axis);
+            StartCardTimer();
+        }
+
+        private void StartCardTimer()
+        {
+            if (_previewOf == null || _cardQueue.Count == 0) return;
+            if (_cardTimer == null)
+            {
+                _cardTimer = new System.Windows.Forms.Timer { Interval = 150 };
+                FormClosed += (s0, e0) => { try { _cardTimer.Stop(); _cardTimer.Dispose(); } catch { } };
+                _cardTimer.Tick += (s, e) =>
+                {
+                    // wait while the user is working in the dialog (typing / mouse down)
+                    if (Control.MouseButtons != MouseButtons.None || (_grid != null && _grid.IsCurrentCellInEditMode)) return;
+                    if (_cardQueue.Count == 0) { _cardTimer.Stop(); return; }
+                    string ax = _cardQueue[0];
+                    _cardQueue.RemoveAt(0);
+                    FillCard(ax);
+                    if (_cardQueue.Count == 0) _cardTimer.Stop();
+                };
+            }
+            if (!_cardTimer.Enabled) _cardTimer.Start();
+        }
+
+        // the picture of one card (made by Revit: the section exported as an image)
+        private void FillCard(string axis)
+        {
+            AxisCard card = _cards.FirstOrDefault(c => c.Axis == axis);
+            AxisData a = Excel?.Axes.FirstOrDefault(x => x.Name == axis);
+            if (card == null || a == null || card.IsDisposed) return;
+            int k = Excel.Axes.IndexOf(a);
+            void Sel() { if (k >= 0 && _tabs.SelectedIndex != k) _tabs.SelectedIndex = k; }
+            Control c = null;
+            string err = null;
+            try { c = _previewOf(a, "image"); } catch (Exception ex) { err = ex.Message; }
+            foreach (Control old in card.Host.Controls.Cast<Control>().ToList()) { card.Host.Controls.Remove(old); old.Dispose(); }
+            card.Preview = null;
+            if (c != null)
+            {
+                c.Dock = DockStyle.Fill; card.Host.Controls.Add(c); card.Preview = c;
+                c.Click += (s, e) => Sel(); c.DoubleClick += (s, e) => { Sel(); OpenBig(); };
+                c.Cursor = Cursors.Hand;
+            }
+            else card.Host.Controls.Add(new Label { Dock = DockStyle.Fill, Text = err == null ? "No section" : "Section not shown: " + err, ForeColor = Grey, TextAlign = ContentAlignment.MiddleCenter });
         }
 
         // each card under the bubble of its axis (equal widths; spread evenly when the axes are too close)

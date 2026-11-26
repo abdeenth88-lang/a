@@ -1,4 +1,4 @@
-// AB Bridges for Revit - "Substructure": places the substructure families at every axis of the bridge
+﻿// AB Bridges for Revit - "Substructure": places the substructure families at every axis of the bridge
 // (sheet "Substructure" of the Excel from Civil 3D: axis point, direction, design surface, NGL).
 // Any family type of the project can be chosen; it is set by one point (its top): point / work plane / face based,
 // one-point adaptive, and columns (top at the point, length kept). Line based and multi-point adaptive families are reported.
@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Text;
 using Autodesk.Revit.Attributes;
@@ -252,7 +253,9 @@ namespace ABBridgesRevit
                 try
                 {
                     ElementId tt = doc.GetDefaultElementTypeId(ElementTypeGroup.TextNoteType);
-                    XYZ at = geo.ToInternal(a.X + dx * p[0].off, a.Y + dy * p[0].off, p[0].z + 0.4);
+                    // the name a bit out to the right of the line's end (clear of the section), at its level
+                    var end = p[p.Count - 1];
+                    XYZ at = geo.ToInternal(a.X + dx * (end.off + 1.2), a.Y + dy * (end.off + 1.2), end.z + 0.25);
                     if (tt != null && tt != ElementId.InvalidElementId) ids.Add(TextNote.Create(doc, vs.Id, at, label, tt).Id);
                 }
                 catch { }
@@ -260,7 +263,7 @@ namespace ABBridgesRevit
             try { Sand(doc, vs, geo, a, dx, dy, ids); } catch { }        // first: the lines / texts made after it are drawn over it
             Draw(a.Design, "AB Design surface", 37, 99, 235, "Design surface");
             Draw(a.Ngl, "AB NGL", 133, 79, 11, "NGL");
-            try { SectionDims(doc, vs, geo, a, dx, dy, ids); } catch { }
+            // (no dimensions in the section: not needed - the old ones go with the lines above)
             map[LinesKey + a.Name] = AbStore.Ids(ids);
         }
 
@@ -281,7 +284,7 @@ namespace ABBridgesRevit
             // the ground as a thin solid in the view plane, minus the cut elements
             XYZ u = geo.Vec(dx, dy), nrm = XYZ.BasisZ.CrossProduct(u).Normalize();
             double th = 0.01;
-            Solid ground = GeometryCreationUtilities.CreateExtrudedGeometry(new[] { outer }, nrm, th);
+            Solid ground = GeometryCreationUtilities.CreateExtrusionGeometry(new[] { outer }, nrm, th);
             XYZ p0 = geo.ToInternal(a.X, a.Y, 0);
             Plane pl = Plane.CreateByNormalAndOrigin(nrm, p0);
             var opt = new Options { ComputeReferences = false, DetailLevel = ViewDetailLevel.Fine };
@@ -301,7 +304,7 @@ namespace ABBridgesRevit
                         for (int i = 0; i < lp.Count; i++) { XYZ q0 = lp[i], q1 = lp[(i + 1) % lp.Count]; if (q0.DistanceTo(q1) > 1e-4) cl.Append(Line.CreateBound(q0, q1)); }
                         try
                         {
-                            Solid hole = GeometryCreationUtilities.CreateExtrudedGeometry(new[] { cl }, nrm, th);
+                            Solid hole = GeometryCreationUtilities.CreateExtrusionGeometry(new[] { cl }, nrm, th);
                             ground = BooleanOperationsUtils.ExecuteBooleanOperation(ground, hole, BooleanOperationsType.Difference);
                         }
                         catch { }
@@ -389,6 +392,28 @@ namespace ABBridgesRevit
 
         // the look of the section, like the drawings: black lines, the cut pattern of each material (concrete hatch ...),
         // no colours, no crop frame, fine detail, hidden lines off
+        // the ground (topography / toposolid: the black cut hatch under the NGL) and the linked / imported CAD
+        // are not wanted in the AB sections - the NGL and Design lines of the add-in show the ground
+        private static void HideGroundAndCad(Document doc, View v)
+        {
+            foreach (BuiltInCategory bic in new[] { BuiltInCategory.OST_Topography, BuiltInCategory.OST_Toposolid })
+            {
+                try
+                {
+                    Category c = Category.GetCategory(doc, bic);
+                    if (c != null && v.CanCategoryBeHidden(c.Id)) v.SetCategoryHidden(c.Id, true);
+                }
+                catch { }
+            }
+            try
+            {
+                var cad = new FilteredElementCollector(doc).OfClass(typeof(ImportInstance))
+                    .Where(e => e.CanBeHidden(v) && !e.IsHidden(v)).Select(e => e.Id).ToList();
+                if (cad.Count > 0) v.HideElements(cad);
+            }
+            catch { }
+        }
+
         private static void StyleSection(Document doc, ViewSection vs, Dictionary<string, string> map)
         {
             try
@@ -396,6 +421,7 @@ namespace ABBridgesRevit
                 vs.DetailLevel = ViewDetailLevel.Fine;
                 try { vs.DisplayStyle = DisplayStyle.HLR; } catch { }
                 try { vs.CropBoxVisible = false; } catch { }
+                HideGroundAndCad(doc, vs);
                 FillPatternElement solid = new FilteredElementCollector(doc).OfClass(typeof(FillPatternElement)).Cast<FillPatternElement>()
                     .FirstOrDefault(f => f.GetFillPattern().IsSolidFill);
                 HashSet<long> mine = Mine(map);
@@ -647,8 +673,15 @@ namespace ABBridgesRevit
 
             // the real section at an axis, shown in the dialog (made / reused, with the Design and NGL lines)
             SubstructureForm formRef = null;
+            // a view made ready once (lines, style, snaps) is shown again at once when going back to its axis;
+            // Apply on the axis makes it ready again
+            var ready = new Dictionary<string, (ElementId view, List<XYZ> pts, List<(XYZ a, XYZ b)> segs)>(StringComparer.OrdinalIgnoreCase);
+            var prepared = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // sections made / styled in this session
             Func<AxisData, string, System.Windows.Forms.Control> previewOf = (a, mode) =>
             {
+                string rk = a.Name + "|" + mode;
+                if (mode != "image" && ready.TryGetValue(rk, out var rv) && doc.GetElement(rv.view) is View)
+                    return new PreviewHost(doc, rv.view, rv.pts, rv.segs);
                 var spts = new List<XYZ>();
                 var ssegs = new List<(XYZ a, XYZ b)>();
                 if (mode == "plan")
@@ -665,21 +698,32 @@ namespace ABBridgesRevit
                     }
                     if (vp == null) return null;
                     SnapDataPlan(doc, vp, map, spts, ssegs);
+                    ready[rk] = (vp.Id, spts, ssegs);
                     return new PreviewHost(doc, vp.Id, spts, ssegs);
                 }
-                ViewSection vs;
+                ViewSection vs = null;
                 var plog = new StringBuilder();
-                using (var t = new Transaction(doc, "AB Bridges - section at " + a.Name))
-                {
-                    t.Start();
-                    Quiet(t);
-                    vs = AxisSection(doc, geo, a, sectionOf(a), plog, true);
-                    if (vs != null) { SurfaceLines(doc, vs, geo, a, map); StyleSection(doc, vs, map); }
-                    AbStore.Save(doc, map);
-                    t.Commit();
-                }
+                // the section is made / styled once per axis while the dialog is open; after that it is only shown
+                // (a transaction at every show made the model regenerate and the previews blink)
+                if (prepared.Contains(a.Name))
+                    vs = new FilteredElementCollector(doc).OfClass(typeof(ViewSection)).Cast<ViewSection>()
+                        .FirstOrDefault(x => !x.IsTemplate && x.Name == "AB Section - " + a.Name);
+                if (vs == null)
+                    using (var t = new Transaction(doc, "AB Bridges - section at " + a.Name))
+                    {
+                        t.Start();
+                        Quiet(t);
+                        vs = AxisSection(doc, geo, a, sectionOf(a), plog, true);
+                        if (vs != null) { SurfaceLines(doc, vs, geo, a, map); StyleSection(doc, vs, map); }
+                        AbStore.Save(doc, map);
+                        t.Commit();
+                        if (vs != null) prepared.Add(a.Name);
+                    }
                 if (vs == null) return null;
+                // the cards: a picture of the section (Revit allows only one live preview at a time)
+                if (mode == "image") return SectionPicture(doc, vs, a.Name);
                 SnapData(doc, vs, geo, a, spts, ssegs);
+                ready[rk] = (vs.Id, spts, ssegs);
                 return new PreviewHost(doc, vs.Id, spts, ssegs);
             };
             // Apply: place the families of one axis now (the dialog stays open)
@@ -688,6 +732,7 @@ namespace ABBridgesRevit
                 if (formRef?.Excel == null || !formRef.Axes.TryGetValue(name, out SubAxis ax)) return "";
                 AxisData a = formRef.Excel.Axes.FirstOrDefault(x => x.Name == name);
                 if (a == null) return "";
+                ready.Remove(name + "|section"); ready.Remove(name + "|plan");     // made again with the new families (snaps too)
                 foreach (SubRow r in ax.Rows.Where(r => !string.IsNullOrEmpty(r.Family))) paramsOf(r.Family);
                 var one = new Dictionary<string, SubAxis>(StringComparer.OrdinalIgnoreCase) { [name] = new SubAxis { Name = name, Create = true, Rows = ax.Rows } };
                 var alog = new StringBuilder();
@@ -696,6 +741,9 @@ namespace ABBridgesRevit
                     t.Start();
                     WarningSwallower w = Quiet(t);
                     Create(doc, geo, syms, sectionOf, paramsOf, formRef.Excel, one, map, alog, false);
+                    ViewSection sv = new FilteredElementCollector(doc).OfClass(typeof(ViewSection)).Cast<ViewSection>()
+                        .FirstOrDefault(x => !x.IsTemplate && x.Name == "AB Section - " + name);
+                    if (sv != null) StyleSection(doc, sv, map);
                     foreach (SubAxis sx in formRef.Axes.Values) map[AxKey + sx.Name] = sx.Encode();
                     map[LastKey] = name;
                     if (!string.IsNullOrEmpty(formRef.ExcelPath)) map[ExcelKey] = formRef.ExcelPath;
@@ -986,6 +1034,35 @@ namespace ABBridgesRevit
                 return (M(Math.Min(a.X, b.X)), M(Math.Max(a.X, b.X)), z0, z1);
             }
             catch { return null; }
+        }
+
+        // a PNG of the section view (exported to %TEMP%), shown in a picture box that zooms to fit
+        private static System.Windows.Forms.Control SectionPicture(Document doc, View v, string axis)
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "AB Bridges cards");
+            Directory.CreateDirectory(dir);
+            string prefix = "AB_" + string.Concat(axis.Where(ch => char.IsLetterOrDigit(ch) || ch == '_'));
+            foreach (string old in Directory.GetFiles(dir, prefix + "*.png")) { try { File.Delete(old); } catch { } }
+            var opt = new ImageExportOptions
+            {
+                ExportRange = ExportRange.SetOfViews,
+                FilePath = Path.Combine(dir, prefix),
+                HLRandWFViewsFileType = ImageFileType.PNG,
+                ShadowViewsFileType = ImageFileType.PNG,
+                ImageResolution = ImageResolution.DPI_150,
+                ZoomType = ZoomFitType.FitToPage,
+                FitDirection = FitDirectionType.Horizontal,
+                PixelSize = 900
+            };
+            opt.SetViewsAndSheets(new List<ElementId> { v.Id });
+            doc.ExportImage(opt);
+            string file = Directory.GetFiles(dir, prefix + "*.png").OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault();
+            if (file == null) return null;
+            System.Drawing.Image img;
+            using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read))
+            using (var src = System.Drawing.Image.FromStream(fs))
+                img = new System.Drawing.Bitmap(src);        // a copy, so the file is not kept open
+            return new System.Windows.Forms.PictureBox { Image = img, SizeMode = System.Windows.Forms.PictureBoxSizeMode.Zoom, BackColor = System.Drawing.Color.White };
         }
 
         // ---------------------------------------------------------------- deck section
@@ -1377,7 +1454,7 @@ namespace ABBridgesRevit
                             {
                                 doc.Regenerate();
                                 if (CutRaw(made.inst, copt, cpl, cp0, cnrm).Count == 0)
-                                    notes.Add($"{what}: placed, but nothing of it is on the axis line, so the section (far clip 0.01 m) does not show it - see it in 3D");
+                                    notes.Add($"{what}: placed, but nothing of it is on the axis line, so the section at the axis does not show it - see it in 3D");
                             }
                             catch { }
                         }
@@ -1657,7 +1734,9 @@ namespace ABBridgesRevit
 
         // ---------------------------------------------------------------- See Section
 
-        // a section view at the axis (looking along the bridge, far clip 0.01 m), named "AB Section - {axis}", opened
+        private const double Slice = 0.30;     // the section slice at an axis, m (from 0.15 before the axis to 0.15 after)
+
+        // a section view at the axis (looking along the bridge, a 0.30 m slice centred on the axis), named "AB Section - {axis}"
         private static ViewSection AxisSection(Document doc, Geo geo, AxisData a, SubSection sec, StringBuilder log, bool reuse)
         {
             ViewFamilyType vft = new FilteredElementCollector(doc).OfClass(typeof(ViewFamilyType)).Cast<ViewFamilyType>()
@@ -1676,24 +1755,31 @@ namespace ABBridgesRevit
             double zMid = (zTop + zBot) / 2, half = (zTop - zBot) / 2;
             double xMid = (L + R) / 2, halfW = (R - L) / 2 + 3;
 
-            XYZ o = geo.ToInternal(a.X + dx * xMid, a.Y + dy * xMid, zMid);
+            // the cut plane stands Slice/2 before the axis and the view sees Slice deep: a thin slice ON the axis line.
+            // (it was 0.01 m starting exactly on the axis: faces lying on the axis plane were cut or not by rounding,
+            //  so the families showed and vanished from one placing to the next)
             XYZ u = geo.Vec(dx, dy);
+            XYZ nz = u.CrossProduct(XYZ.BasisZ);       // the view looks along -BasisZ
+            XYZ o = geo.ToInternal(a.X + dx * xMid, a.Y + dy * xMid, zMid) + nz * Ft(Slice / 2);
             var t = Transform.Identity;
             t.Origin = o;
             t.BasisX = u;
             t.BasisY = XYZ.BasisZ;
-            t.BasisZ = u.CrossProduct(XYZ.BasisZ);     // the view looks along -BasisZ
+            t.BasisZ = nz;
             var box = new BoundingBoxXYZ
             {
                 Transform = t,
-                Min = new XYZ(-Ft(halfW), -Ft(half), -Ft(0.01)),
+                Min = new XYZ(-Ft(halfW), -Ft(half), -Ft(Slice)),
                 Max = new XYZ(Ft(halfW), Ft(half), 0)
             };
 
             string name = "AB Section - " + a.Name;
             ViewSection old = new FilteredElementCollector(doc).OfClass(typeof(ViewSection)).Cast<ViewSection>()
                 .FirstOrDefault(v => !v.IsTemplate && v.Name == name);
-            if (old != null && reuse) return old;     // kept as it is (with what was done in it)
+            // kept as it is (with what was done in it) - but an old 1 cm section is made again with the new slice
+            bool oldThin = false;
+            try { Parameter fp = old?.get_Parameter(BuiltInParameter.VIEWER_BOUND_OFFSET_FAR); oldThin = fp != null && fp.AsDouble() < Ft(0.02); } catch { }
+            if (old != null && reuse && !oldThin) return old;
             if (old != null)
             {
                 try { doc.Delete(old.Id); }
@@ -1701,7 +1787,7 @@ namespace ABBridgesRevit
             }
             ViewSection vs = ViewSection.CreateSection(doc, vft.Id, box);
             try { vs.Name = name; } catch { }
-            try { vs.get_Parameter(BuiltInParameter.VIEWER_BOUND_OFFSET_FAR)?.Set(Ft(0.01)); } catch { }
+            try { vs.get_Parameter(BuiltInParameter.VIEWER_BOUND_OFFSET_FAR)?.Set(Ft(Slice)); } catch { }
             try { vs.Scale = 100; } catch { }
             try { vs.DetailLevel = ViewDetailLevel.Fine; } catch { }
             try { vs.CropBoxActive = true; vs.CropBoxVisible = true; } catch { }

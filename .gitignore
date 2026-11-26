@@ -1,1 +1,7 @@
 Reference/
+bin/
+obj/
+publish/
+payload/
+build_log.txt
+*.user

@@ -37,6 +37,7 @@ namespace ABBridgesRevit
         public List<TendonProfile> Profiles = new List<TendonProfile>();     // per stage and path (cut at the splits)
         public List<TendonProfile> Whole = new List<TendonProfile>();        // per path, as typed
         public Dictionary<int, string> Splits = new Dictionary<int, string>();
+        public List<string> Problems = new List<string>();                   // found while reading the sheet
         public TendonProfile Get(int s, int p) => Profiles.FirstOrDefault(x => x.Stage == s && x.Path == p);
     }
 
@@ -62,7 +63,8 @@ namespace ABBridgesRevit
         // then "Split at (X)" (e.g. 0.85L2 or 0.85L2; 0.72L4) and the data rows. The stages are cut at the splits.
         public static TendonSet Read(string path, TendonGeo g)
         {
-            Dictionary<(int r, int c), string> cells = BridgeExcel.ReadCells(path, Name);
+            // the workbook open in Excel: what is on the screen is read (no need to save first)
+            Dictionary<(int r, int c), string> cells = (IsLocked(path) ? XlLive.Cells(path, Name) : null) ?? BridgeExcel.ReadCells(path, Name);
             if (cells == null) return null;
             string T(int r, int c) => cells.TryGetValue((r, c), out string v) ? v.Trim() : "";
             double N(int r, int c) => double.TryParse(T(r, c), NumberStyles.Float, CI, out double v) ? v : double.NaN;
@@ -78,8 +80,16 @@ namespace ABBridgesRevit
                 for (; r <= maxR; r++)
                 {
                     string x = T(r, c);
-                    if (x.Length == 0 || x == SplitRow || DataRows.Contains(x, StringComparer.OrdinalIgnoreCase)) break;
+                    if (x == SplitRow || DataRows.Contains(x, StringComparer.OrdinalIgnoreCase)) break;
+                    if (x.Length == 0)
+                    {
+                        if (T(r, c + 1).Length > 0) set.Problems.Add($"Path {whole.Path}, row {r}: a Y without its X");
+                        continue;                                       // an empty row between the anchors
+                    }
+                    if (!TendonGeo.IsAnchor(x) && g != null && double.IsNaN(g.StationOf(x)))
+                        set.Problems.Add($"Path {whole.Path}, row {r}: \"{x}\" is not a place on the bridge (write it like 0.4L1 or 0.725L2)");
                     whole.Pts.Add((x, N(r, c + 1)));
+                    if (x.Trim().Equals("Anchor2", StringComparison.OrdinalIgnoreCase)) { r++; break; }
                 }
                 string splits = "";
                 for (; r <= maxR; r++)
@@ -126,6 +136,31 @@ namespace ABBridgesRevit
             return res;
         }
 
+        // rows of X that are left from a split that moved: not a 0.1 point, not an anchor, not a split now, and either
+        // a split before (lastSplits) or a row with no Y typed. Per path.
+        public static Dictionary<int, List<string>> Stale(TendonSet set, TendonGeo g, Func<int, string> lastSplits)
+        {
+            var res = new Dictionary<int, List<string>>();
+            var grid = new HashSet<long>(DefaultX(g.Spans).Where(x => !TendonGeo.IsAnchor(x)).Select(x => Key(g.StationOf(x))));
+            foreach (TendonProfile w in set.Whole)
+            {
+                var now = new HashSet<long>(SplitList(set, w.Path).Select(x => Key(g.StationOf(x))));
+                var before = new HashSet<long>((lastSplits?.Invoke(w.Path) ?? "").Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries)
+                                               .Select(x => g.StationOf(x.Trim())).Where(st => !double.IsNaN(st)).Select(Key));
+                var drop = w.Pts.Where(q => !TendonGeo.IsAnchor(q.x))
+                                .Where(q => { double st = g.StationOf(q.x); if (double.IsNaN(st)) return false; long k = Key(st);
+                                              return !grid.Contains(k) && !now.Contains(k); })
+                                .Select(q => q.x).ToList();
+                if (drop.Count > 0) res[w.Path] = drop;
+            }
+            return res;
+        }
+
+        private static long Key(double st) => (long)Math.Round(st * 1000);
+
+        public static List<string> SplitList(TendonSet set, int path) =>
+            set.Splits.TryGetValue(path, out string s) ? s.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).ToList() : new List<string>();
+
         // default X of a whole path: Anchor1, every 0.1 of every span, Anchor2
         private static List<string> DefaultX(int spans)
         {
@@ -137,7 +172,78 @@ namespace ABBridgesRevit
         }
 
         // writes the sheet (new, or again with more / fewer paths) keeping every value already typed
-        public static void Write(string path, int paths, int spans, TendonSet old, TendonGeo g = null)
+        public static List<string> SplitList(string v) =>
+            (v ?? "").Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+
+        // ---------------- the new sheet (button "Tendon Excel"): per path Anchor1, empty rows, Anchor2, then the data.
+        // empty rows between the anchors = 10 x spans + the splits of that path (the user types every X and Y)
+        public static void Template(string path, int spans, List<int> splitsPerPath)
+        {
+            var rows = new SortedDictionary<int, SortedDictionary<int, (string v, bool num, int style)>>();
+            void Put(int r, int c, string v, int style, bool num = false)
+            {
+                if (!rows.TryGetValue(r, out var row)) rows[r] = row = new SortedDictionary<int, (string, bool, int)>();
+                row[c] = (v, num, StylePlaceholder + style);
+            }
+            int paths = Math.Max(1, splitsPerPath.Count);
+            Put(1, 1, "AB Bridges - Tendon Profile: type X and Y of every point between Anchor1 and Anchor2 (X like 0.4L1, 0.725L2); Y = top of box to tendon CG (m). The splits are chosen in Revit (Draw Tendon).", 1);
+            Put(2, 1, "Number of paths", 2); Put(2, 2, paths.ToString(CI), 3, true);
+            int col = 1;
+            for (int p = 1; p <= paths; p++)
+            {
+                int n = 10 * spans + Math.Max(0, splitsPerPath[p - 1]);
+                Put(5, col, $"Path {p}", 1); Put(5, col + 1, $"{splitsPerPath[p - 1]} split(s)", 1);
+                Put(6, col, "X", 2); Put(6, col + 1, "Y-Tendon (m)", 2);
+                int r = 7;
+                Put(r, col, "Anchor1", 4); Put(r, col + 1, "", 3); r++;
+                for (int k = 0; k < n; k++, r++) { Put(r, col, "", 3); Put(r, col + 1, "", 3); }
+                Put(r, col, "Anchor2", 4); Put(r, col + 1, "", 3); r++;
+                r++;
+                for (int k = 0; k < DataRows.Length; k++, r++)
+                {
+                    Put(r, col, DataRows[k], 4);
+                    Put(r, col + 1, DataDefaults[k], 3, double.TryParse(DataDefaults[k], NumberStyles.Float, CI, out _));
+                }
+                col += 3;
+            }
+            Output(path, rows, col);
+        }
+
+        // the splits chosen in Revit cut every path into its stages
+        public static void ApplySplits(TendonSet set, TendonGeo g, Dictionary<int, string> splits)
+        {
+            set.Splits = new Dictionary<int, string>(splits);
+            set.Profiles.Clear();
+            foreach (TendonProfile w in set.Whole.Where(w => w.Path <= set.Paths))
+                foreach (TendonProfile sp in Cut(w, splits.TryGetValue(w.Path, out string v) ? v : "", g)) set.Profiles.Add(sp);
+            set.Stages = set.Profiles.Select(x => x.Stage).DefaultIfEmpty(1).Max();
+        }
+
+        // what stops the drawing: points without Y, a split that is not one of the X rows of its path, ...
+        public static List<string> Check(TendonSet set, TendonGeo g, Dictionary<int, string> splits)
+        {
+            var res = new List<string>(set.Problems);
+            for (int p = 1; p <= set.Paths; p++)
+            {
+                TendonProfile w = set.Whole.FirstOrDefault(x => x.Path == p);
+                if (w == null) { res.Add($"Path {p}: no block in the sheet (press Tendon Excel again)"); continue; }
+                var inner = w.Pts.Where(q => !TendonGeo.IsAnchor(q.x)).ToList();
+                if (inner.Count < 2) { res.Add($"Path {p}: type its points (X and Y) between Anchor1 and Anchor2"); continue; }
+                var noY = w.Pts.Where(q => double.IsNaN(q.y)).Select(q => q.x).ToList();
+                if (noY.Count > 0) res.Add($"Path {p}: no Y at {string.Join(", ", noY.Take(6))}{(noY.Count > 6 ? " ..." : "")}");
+                var dup = inner.Where(q => !double.IsNaN(g.StationOf(q.x))).GroupBy(q => Math.Round(g.StationOf(q.x), 4)).Where(x => x.Count() > 1).Select(x => x.First().x).ToList();
+                if (dup.Count > 0) res.Add($"Path {p}: the same X twice ({string.Join(", ", dup)})");
+                foreach (string sx in SplitList(splits.TryGetValue(p, out string v) ? v : ""))
+                {
+                    double st = g.StationOf(sx);
+                    if (double.IsNaN(st)) res.Add($"Path {p}: the split \"{sx}\" is not a place on the bridge");
+                    else if (!inner.Any(q => Math.Abs(g.StationOf(q.x) - st) < 1e-6)) res.Add($"Path {p}: the split {TendonGeo.Clean(sx)} is not one of its X rows");
+                }
+            }
+            return res;
+        }
+
+        public static void Write(string path, int paths, int spans, TendonSet old, TendonGeo g = null, Dictionary<int, List<string>> drop = null)
         {
             var rows = new SortedDictionary<int, SortedDictionary<int, (string v, bool num, int style)>>();
             void Put(int r, int c, string v, int style, bool num = false)
@@ -153,7 +259,8 @@ namespace ABBridgesRevit
                 TendonProfile was = old?.Whole.FirstOrDefault(x => x.Path == p);
                 Put(5, col, $"Path {p}", 1);
                 Put(6, col, "X", 2); Put(6, col + 1, "Y-Tendon (m)", 2);
-                var pts = (was != null && was.Pts.Count > 0 ? was.Pts : DefaultX(spans).Select(x => (x, double.NaN))).ToList();
+                var pts = (was != null && was.Pts.Count > 0 ? was.Pts : DefaultX(spans).Select(x => (x: x, y: double.NaN))).ToList();
+                if (drop != null && drop.TryGetValue(p, out var dl)) pts.RemoveAll(q => dl.Contains(q.x));      // the row of a split that moved
                 // every split gets its own row in X (in its place along the path), Y empty to be typed
                 if (g != null && old != null && old.Splits.TryGetValue(p, out string sps))
                     foreach (string sx in sps.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()))
@@ -162,7 +269,7 @@ namespace ABBridgesRevit
                         if (double.IsNaN(st) || pts.Any(q => Math.Abs(g.StationOf(q.x) - st) < 1e-6)) continue;
                         int at = pts.FindIndex(q => !TendonGeo.IsAnchor(q.x) && g.StationOf(q.x) > st);
                         if (at < 0) at = Math.Max(0, pts.Count - 1);
-                        pts.Insert(at, (sx, double.NaN));
+                        pts.Insert(at, (TendonGeo.Clean(sx), double.NaN));
                     }
                 int r = 7;
                 foreach (var q in pts)
@@ -183,6 +290,19 @@ namespace ABBridgesRevit
                 col += 3;
             }
 
+            Output(path, rows, col);
+        }
+
+        // the sheet into the file, or into the workbook open in Excel (then saved there)
+        private static void Output(string path, SortedDictionary<int, SortedDictionary<int, (string v, bool num, int style)>> rows, int col)
+        {
+            if (IsLocked(path))
+            {
+                var cells = new List<(int r, int c, string v, bool num, int style)>();
+                foreach (var row in rows) foreach (var cell in row.Value) cells.Add((row.Key, cell.Key, cell.Value.v, cell.Value.num, cell.Value.style - StylePlaceholder));
+                if (XlLive.WriteSheet(path, Name, cells, col)) return;
+                throw new IOException("The Excel is open and could not be written. Close it, then try again.");
+            }
             var sb = new StringBuilder();
             sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"").Append(M.NamespaceName).Append("\"><cols>");
             for (int c = 1; c < col; c++) sb.Append($"<col min=\"{c}\" max=\"{c}\" width=\"{(c % 3 == 0 ? 3 : 22)}\" customWidth=\"1\"/>");
@@ -210,6 +330,98 @@ namespace ABBridgesRevit
                 zip.GetEntry(part)?.Delete();
                 using (var w = new StreamWriter(zip.CreateEntry(part, CompressionLevel.Optimal).Open(), new UTF8Encoding(false))) w.Write(xml);
             }
+                }
+
+        // true when Excel (or anything) has the file open
+        public static bool IsLocked(string path)
+        {
+            try { using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) return false; }
+            catch (IOException) { return true; }
+            catch (UnauthorizedAccessException) { return true; }
+        }
+
+        // the same fixes made straight in the workbook open in Excel (COM): new Path blocks (copied from Path 1, its look kept,
+        // Y and the first data emptied) and a row for every missing split in its place (Y empty, yellow). Not saved: the user types and saves.
+        // Returns what was done, or null when the open workbook could not be reached.
+        public static string WriteLive(string path, TendonSet set, TendonGeo g, Dictionary<int, List<string>> drop = null)
+        {
+            dynamic wb;
+            try { wb = System.Runtime.InteropServices.Marshal.BindToMoniker(path); }
+            catch { return null; }
+            if (wb == null) return null;
+            dynamic ws = null;
+            try { ws = wb.Worksheets[Name]; } catch { }
+            if (ws == null) return null;
+            const int Down = -4121;            // xlShiftDown
+            const int Yellow = 0x00FFFF;       // BGR
+            var done = new List<string>();
+
+            // 1. splits: a row in X / Y of that path only (the data rows of the path move down with it)
+            foreach (TendonProfile w in set.Whole)
+            {
+                int col = 1 + (w.Path - 1) * 3;
+                var pts = w.Pts.ToList();
+                // first the rows of a split that moved go (from the bottom, so the rows above keep their place)
+                if (drop != null && drop.TryGetValue(w.Path, out var dl))
+                    for (int i = pts.Count - 1; i >= 0; i--)
+                        if (dl.Contains(pts[i].x))
+                        {
+                            int row = 7 + i;
+                            ws.Range[ws.Cells[row, col], ws.Cells[row, col + 1]].Delete(-4162);     // xlShiftUp
+                            done.Add($"Path {w.Path}: old split row {pts[i].x} removed");
+                            pts.RemoveAt(i);
+                        }
+                if (!set.Splits.TryGetValue(w.Path, out string sps)) continue;
+                foreach (string sx in sps.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()))
+                {
+                    double st = g.StationOf(sx);
+                    if (double.IsNaN(st) || pts.Any(q => Math.Abs(g.StationOf(q.x) - st) < 1e-6)) continue;
+                    int at = pts.FindIndex(q => !TendonGeo.IsAnchor(q.x) && g.StationOf(q.x) > st);
+                    if (at < 0) at = Math.Max(0, pts.Count - 1);
+                    int row = 7 + at;
+                    ws.Range[ws.Cells[row, col], ws.Cells[row, col + 1]].Insert(Down);
+                    ws.Cells[row, col].Value2 = TendonGeo.Clean(sx);
+                    ws.Cells[row, col + 1].Value2 = "";
+                    ws.Cells[row, col + 1].Interior.Color = Yellow;
+                    pts.Insert(at, (sx, double.NaN));
+                    done.Add($"Path {w.Path}: row {sx} added (row {row}) - type its Y");
+                }
+            }
+
+            // 2. new paths up to B2: a copy of the Path 1 block, emptied
+            TendonProfile p1 = set.Whole.FirstOrDefault(x => x.Path == 1);
+            if (p1 != null)
+            {
+                // the real end of block 1 after the inserts: count its rows again from the sheet
+                int last = 7;
+                while (!string.IsNullOrEmpty(Convert.ToString(ws.Cells[last, 1].Value2))) last++;
+                int xEnd = last - 1;                                   // last X row
+                int blockEnd = xEnd + 2 + DataRows.Length;             // empty row, split row, data rows
+                for (int p = 1; p <= set.Paths; p++)
+                {
+                    if (set.Whole.Any(x => x.Path == p)) continue;
+                    int col = 1 + (p - 1) * 3;
+                    ws.Range[ws.Cells[5, 1], ws.Cells[blockEnd, 2]].Copy(ws.Cells[5, col]);
+                    ws.Columns[col].ColumnWidth = ws.Columns[1].ColumnWidth;
+                    ws.Columns[col + 1].ColumnWidth = ws.Columns[2].ColumnWidth;
+                    ws.Cells[5, col].Value2 = $"Path {p}";
+                    for (int r = 7; r <= xEnd; r++) ws.Cells[r, col + 1].Value2 = "";
+                    ws.Cells[xEnd + 2, col + 1].Value2 = g.Spans >= 2 ? "0.15L2" : "";
+                    for (int k = 0; k < 4; k++) ws.Cells[xEnd + 3 + k, col + 1].Value2 = "";      // PJ, tendons, strands, area: to be typed
+                    done.Add($"Path {p} added - type its Y and data");
+                }
+            }
+            // 3. paths above B2 go (their block is cleared)
+            foreach (TendonProfile w in set.Whole.Where(x => x.Path > set.Paths).ToList())
+            {
+                int col = 1 + (w.Path - 1) * 3;
+                int lastRow = 7;
+                try { lastRow = Math.Max(60, (int)ws.UsedRange.Row + (int)ws.UsedRange.Rows.Count + 2); } catch { lastRow = 200; }
+                ws.Range[ws.Cells[4, col], ws.Cells[lastRow, col + 1]].Clear();
+                done.Add($"Path {w.Path} removed (B2 = {set.Paths})");
+            }
+            try { wb.Activate(); ws.Activate(); wb.Application.Visible = true; } catch { }
+            return string.Join("\n", done);
         }
 
         private const int StylePlaceholder = 1000;
@@ -226,7 +438,7 @@ namespace ABBridgesRevit
         private static void Save(ZipArchive zip, string name, XDocument doc)
         {
             zip.GetEntry(name)?.Delete();
-            using (var w = new StreamWriter(zip.CreateEntry(name, CompressionLevel.Optimal).Open(), new UTF8Encoding(false))) doc.Save(w, SaveOptions.DisableFormatting);
+            using (var w = new StreamWriter(zip.CreateEntry(name, CompressionLevel.Optimal).Open(), new UTF8Encoding(false))) doc.Save(w, System.Xml.Linq.SaveOptions.DisableFormatting);
         }
 
         // 4 styles: 1 title (navy, white), 2 header (amber), 3 input (light orange), 4 label (grey); returns the index of style 1
@@ -326,6 +538,9 @@ namespace ABBridgesRevit
 
         public static bool IsAnchor(string x) => (x ?? "").Trim().StartsWith("Anc", StringComparison.OrdinalIgnoreCase);
 
+        // "0.725 L2", "0.725l2" -> "0.725L2"
+        public static string Clean(string x) => Regex.Replace(x ?? "", @"\s+", "").Replace('l', 'L');
+
         // the stations of a profile (anchors at the stage ends)
         public List<(string x, double sta, double y)> Stations(TendonSet set, TendonProfile p)
         {
@@ -369,8 +584,18 @@ namespace ABBridgesRevit
     }
 
     // ================================================================ the dialog
+    internal sealed class TendonLoad
+    {
+        public TendonSet Set;
+        public TendonGeo Geo;
+        public string Message = "";
+        public bool Ready;
+    }
+
     internal sealed class TendonForm : Form
     {
+        public string Excel;
+        public TendonLoad Loaded;
         public string TitleBlock;
         public double VScale = 3;
         public bool Make3D = true;
@@ -379,37 +604,127 @@ namespace ABBridgesRevit
         public string TableFamily = NoFamily;          // "Family : Type" or NoFamily
         public string TableFile;                       // a .rfa chosen with Load...
 
-        public TendonForm(TendonSet set, TendonGeo g, List<string> titleBlocks, bool update, List<string> details = null, string lastTable = null)
+        public Dictionary<int, string> Splits = new Dictionary<int, string>();
+
+        public TendonForm(string excel, Func<string, TendonLoad> prepare, List<string> titleBlocks, bool update, List<string> details = null, string lastTable = null, Dictionary<int, string> lastSplits = null)
         {
-            Text = update ? "AB Bridges - Update Tendon" : "AB Bridges - Create Tendon";
+            Text = update ? "AB Bridges - Update Tendon" : "AB Bridges - Draw Tendon";
             Font = new System.Drawing.Font("Segoe UI", 9f);
             FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(520, 470);
+            ClientSize = new Size(520, 680);
             BackColor = WinColor.White;
-            var list = new ListView { Location = new Point(14, 14), Size = new Size(492, 200), View = System.Windows.Forms.View.Details, FullRowSelect = true, HeaderStyle = ColumnHeaderStyle.Nonclickable };
+            Excel = excel;
+            var remember = new Dictionary<int, string>(lastSplits ?? new Dictionary<int, string>());
+
+            // the Excel (read only here: the sheet "Tendon Profile" made by Tendon Excel and filled by hand)
+            Controls.Add(new Label { Text = "Excel", Location = new Point(14, 17), AutoSize = true });
+            var path = new TextBox { Location = new Point(60, 14), Width = 262, ReadOnly = true, Text = excel ?? "", BackColor = WinColor.White };
+            Controls.Add(path);
+            var browse = new Button { Text = "Browse...", Location = new Point(328, 12), Size = new Size(86, 26) };
+            var reload = new Button { Text = "Reload", Location = new Point(420, 12), Size = new Size(86, 26) };
+            Controls.Add(browse); Controls.Add(reload);
+            var status = new Label { Location = new Point(14, 44), Size = new Size(492, 70), BorderStyle = BorderStyle.FixedSingle, Padding = new Padding(6, 4, 4, 4), BackColor = WinColor.FromArgb(244, 246, 249) };
+            Controls.Add(status);
+
+            // the split(s) of every path: one of its X rows (more than one with ;)
+            Controls.Add(new Label { Text = "Splits (one of the X of the path; more than one with ;)", Location = new Point(14, 122), AutoSize = true, ForeColor = UiTheme.Navy });
+            var splitPanel = new System.Windows.Forms.Panel { Location = new Point(14, 142), Size = new Size(492, 120), AutoScroll = true, BorderStyle = BorderStyle.FixedSingle };
+            Controls.Add(splitPanel);
+            var boxes = new Dictionary<int, ComboBox>();
+
+            var list = new ListView { Location = new Point(14, 270), Size = new Size(492, 150), View = System.Windows.Forms.View.Details, FullRowSelect = true, HeaderStyle = ColumnHeaderStyle.Nonclickable };
             list.Columns.Add("Profile", 130); list.Columns.Add("Points", 70); list.Columns.Add("Split after this stage", 270);
-            foreach (TendonProfile p in set.Profiles.OrderBy(x => x.Path).ThenBy(x => x.Stage))
-            {
-                double sp = g.SplitAfter(p);
-                string last = p.Pts.Where(q => !TendonGeo.IsAnchor(q.x)).Select(q => q.x).LastOrDefault() ?? "";
-                int empty = p.Pts.Count - p.Filled;
-                var it = new ListViewItem(new[] { p.Title, empty > 0 ? $"{empty} empty" : $"✓ {p.Pts.Count}",
-                    p.Stage == set.Stages ? "(last stage - to the deck end)" : $"{last}  =  {sp:0.000}" });
-                if (empty > 0) it.ForeColor = WinColor.Firebrick;
-                list.Items.Add(it);
-            }
-            Controls.Add(list);
-            // stages and paths come from the Excel only (Paths = B2, Stages = the splits): shown, not edited here
-            int y = 224;
             var ro = new Label
             {
-                Text = $"Stages: {Math.Max(1, set.Stages)}   ·   Paths: {Math.Max(1, set.Whole.Count)}      (from the Excel: Paths = B2, Stages = the splits)",
-                Location = new Point(14, y), Size = new Size(492, 28), BackColor = WinColor.FromArgb(244, 246, 249), ForeColor = UiTheme.Navy,
+                Location = new Point(14, 426), Size = new Size(492, 26), BackColor = WinColor.FromArgb(244, 246, 249), ForeColor = UiTheme.Navy,
                 TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(8, 0, 0, 0), BorderStyle = BorderStyle.FixedSingle
             };
+            Button ok = null;
+            bool building = false;
+
+            // the splits typed -> stages, checks, the list
+            void Recompute()
+            {
+                if (building) return;
+                TendonSet set = Loaded?.Set;
+                TendonGeo g = Loaded?.Geo;
+                list.Items.Clear();
+                if (set == null || g == null) { if (ok != null) ok.Enabled = false; ro.Text = ""; return; }
+                Splits = boxes.ToDictionary(kv => kv.Key, kv => string.Join("; ", TendonSheet.SplitList(kv.Value.Text).Select(TendonGeo.Clean)));
+                foreach (var kv in Splits) remember[kv.Key] = kv.Value;
+                TendonSheet.ApplySplits(set, g, Splits);
+                List<string> problems = TendonSheet.Check(set, g, Splits);
+                status.Text = problems.Count == 0 ? "Ready: press " + (update ? "Update" : "Draw") + "." : string.Join("\n", problems.Take(6)) + (problems.Count > 6 ? $"\n+ {problems.Count - 6} more" : "") + "\n(fix it in the Excel, save, then Reload)";
+                status.ForeColor = problems.Count == 0 ? WinColor.FromArgb(22, 120, 60) : WinColor.Firebrick;
+                foreach (TendonProfile p in set.Profiles.OrderBy(x => x.Path).ThenBy(x => x.Stage))
+                {
+                    double sp = g.SplitAfter(p);
+                    string last = p.Pts.Where(q => !TendonGeo.IsAnchor(q.x)).Select(q => q.x).LastOrDefault() ?? "";
+                    int empty = p.Pts.Count - p.Filled;
+                    var it = new ListViewItem(new[] { p.Title, empty > 0 ? $"{empty} empty" : $"✓ {p.Pts.Count}",
+                        p.Stage == set.Stages || p.Pts.LastOrDefault().x == "Anchor2" ? "(last stage - to the deck end)" : $"{last}  =  {sp:0.000}" });
+                    if (empty > 0) it.ForeColor = WinColor.Firebrick;
+                    list.Items.Add(it);
+                }
+                ro.Text = $"Stages: {Math.Max(1, set.Stages)}   ·   Paths: {Math.Max(1, set.Paths)}   (paths = B2, stages = the splits)";
+                if (ok != null) ok.Enabled = problems.Count == 0;
+            }
+
+            void ShowLoad(TendonLoad ld)
+            {
+                Loaded = ld;
+                building = true;
+                splitPanel.Controls.Clear();
+                boxes.Clear();
+                TendonSet set = ld?.Set;
+                if (set != null)
+                {
+                    int y = 6;
+                    for (int p = 1; p <= set.Paths; p++)
+                    {
+                        TendonProfile w = set.Whole.FirstOrDefault(x => x.Path == p);
+                        splitPanel.Controls.Add(new Label { Text = $"Path {p}", Location = new Point(8, y + 4), AutoSize = true });
+                        var cb = new ComboBox { Location = new Point(70, y), Width = 390, DropDownStyle = ComboBoxStyle.DropDown };
+                        if (w != null) cb.Items.AddRange(w.Pts.Where(q => !TendonGeo.IsAnchor(q.x)).Select(q => (object)q.x).ToArray());
+                        cb.Text = remember.TryGetValue(p, out string last) ? last : "";
+                        cb.TextChanged += (s, e) => Recompute();
+                        splitPanel.Controls.Add(cb);
+                        boxes[p] = cb;
+                        y += 30;
+                    }
+                }
+                building = false;
+                if (set == null)
+                {
+                    status.Text = ld?.Message ?? "";
+                    status.ForeColor = WinColor.Firebrick;
+                    list.Items.Clear(); ro.Text = "";
+                    if (ok != null) ok.Enabled = false;
+                }
+                else Recompute();
+            }
+            void LoadExcel(string p)
+            {
+                Cursor old = Cursor.Current;
+                Cursor.Current = Cursors.WaitCursor;
+                try { Excel = p; path.Text = p ?? ""; ShowLoad(prepare(p)); }
+                catch (Exception ex) { ShowLoad(new TendonLoad { Message = "Could not read the Excel: " + ex.Message }); }
+                finally { Cursor.Current = old; }
+            }
+            browse.Click += (s, e) =>
+            {
+                using (var d = new OpenFileDialog { Title = "Choose the bridge Excel", Filter = "Excel (*.xlsx)|*.xlsx" })
+                {
+                    if (!string.IsNullOrEmpty(Excel) && File.Exists(Excel)) { d.InitialDirectory = Path.GetDirectoryName(Excel); d.FileName = Path.GetFileName(Excel); }
+                    if (d.ShowDialog(this) == DialogResult.OK) LoadExcel(d.FileName);
+                }
+            };
+            reload.Click += (s, e) => LoadExcel(Excel);
+            Shown += (s, e) => { if (!string.IsNullOrEmpty(Excel) && File.Exists(Excel)) LoadExcel(Excel); else ShowLoad(new TendonLoad { Message = "Choose the bridge Excel (Browse...)." }); };
+            Controls.Add(list);
             Controls.Add(ro);
-            y += 42;
+            int y = 466;
             Controls.Add(new Label { Text = "Vertical scale", Location = new Point(14, y + 3), AutoSize = true });
             var vs = new NumericUpDown { Location = new Point(110, y), Width = 60, Minimum = 1, Maximum = 10, DecimalPlaces = 1, Value = 3 };
             Controls.Add(vs);
@@ -448,12 +763,13 @@ namespace ABBridgesRevit
             };
             Controls.Add(load);
 
-            var ok = new Button { Text = update ? "Update" : "Create", Location = new Point(316, 420), Size = new Size(92, 32), BackColor = UiTheme.Navy, ForeColor = WinColor.White, FlatStyle = FlatStyle.Flat };
-            var cancel = new Button { Text = "Cancel", Location = new Point(414, 420), Size = new Size(92, 32), DialogResult = DialogResult.Cancel };
+            ok = new Button { Text = update ? "Update" : "Draw", Location = new Point(316, 630), Size = new Size(92, 32), BackColor = UiTheme.Navy, ForeColor = WinColor.White, FlatStyle = FlatStyle.Flat, Enabled = false };
+            var cancel = new Button { Text = "Cancel", Location = new Point(414, 630), Size = new Size(92, 32), DialogResult = DialogResult.Cancel };
             ok.Click += (s, e) =>
             {
                 TitleBlock = tb.SelectedItem as string; VScale = (double)vs.Value; Make3D = c3.Checked;
-                Stages = Math.Max(1, set.Stages); Paths = Math.Max(1, set.Whole.Count);
+                if (Loaded?.Set == null || !ok.Enabled) return;
+                Stages = Math.Max(1, Loaded.Set.Stages); Paths = Math.Max(1, Loaded.Set.Paths);
                 string pick = tf.SelectedItem as string ?? NoFamily;
                 if (!pick.EndsWith(" (file)")) TableFile = null;
                 TableFamily = pick == Def ? TendonDraw.TableFamilyName : pick;
@@ -461,8 +777,232 @@ namespace ABBridgesRevit
             };
             Controls.Add(ok); Controls.Add(cancel);
             CancelButton = cancel;
-            Brand.AddHeader(this, update ? "Update Tendon" : "Create Tendon");
+            Brand.AddHeader(this, update ? "Update Tendon" : "Draw Tendon");
             Shown += (s, e) => UiTheme.Snap(this, "Revit " + Text.Replace("AB Bridges - ", ""));
+        }
+    }
+
+    // ================================================================ the long section view of a path
+    internal static class TendonViews
+    {
+        private static double Ft(double m) => UnitUtils.ConvertToInternalUnits(m, UnitTypeId.Meters);
+
+        // made once (in an empty place far from the bridge, nothing of the model in it); made again: its dependent
+        // views and what was drawn in it go first
+        public static ViewSection PathView(Document doc, ViewFamilyType secT, int path, Dictionary<string, string> map, string key, string idsKey)
+        {
+            ViewSection v = map.TryGetValue(key, out string vid) && long.TryParse(vid, out long l) ? doc.GetElement(new ElementId(l)) as ViewSection : null;
+            if (v != null)
+            {
+                foreach (ElementId d in v.GetDependentViewIds().ToList()) { try { doc.Delete(d); } catch { } }
+                try { v.CropBoxActive = false; } catch { }      // all of the new drawing is seen while it is measured
+                if (map.TryGetValue(idsKey, out string old))
+                    foreach (string sid in old.Split(',')) if (long.TryParse(sid, out long l2)) { try { doc.Delete(new ElementId(l2)); } catch { } }
+                return v;
+            }
+            var t = Transform.Identity;
+            t.Origin = new XYZ(-Ft(6000), -Ft(6000) - Ft(300) * path, 0);
+            t.BasisX = XYZ.BasisX;
+            t.BasisY = XYZ.BasisZ;
+            t.BasisZ = XYZ.BasisX.CrossProduct(XYZ.BasisZ);          // the view looks along -BasisZ
+            var box = new BoundingBoxXYZ { Transform = t, Min = new XYZ(-Ft(100), -Ft(150), -Ft(0.3)), Max = new XYZ(Ft(2000), Ft(100), 0) };
+            v = ViewSection.CreateSection(doc, secT.Id, box);
+            try { v.Name = "AB Tendon - Path " + path; } catch { }
+            try { v.ViewTemplateId = ElementId.InvalidElementId; } catch { }
+            try { v.Scale = 150; } catch { }
+            try { v.DetailLevel = ViewDetailLevel.Fine; } catch { }
+            try { v.get_Parameter(BuiltInParameter.VIEWER_BOUND_OFFSET_FAR)?.Set(Ft(0.3)); } catch { }
+            // only the drawing: no levels, grids, other sections, model
+            foreach (BuiltInCategory bic in new[] { BuiltInCategory.OST_Levels, BuiltInCategory.OST_Grids, BuiltInCategory.OST_Sections, BuiltInCategory.OST_Elev,
+                                                     BuiltInCategory.OST_Callouts, BuiltInCategory.OST_CLines, BuiltInCategory.OST_ReferenceViewer, BuiltInCategory.OST_VolumeOfInterest })
+            {
+                try { Category c = Category.GetCategory(doc, bic); if (c != null && v.CanCategoryBeHidden(c.Id)) v.SetCategoryHidden(c.Id, true); } catch { }
+            }
+            try { v.AreAnnotationCategoriesHidden = false; } catch { }
+            try { v.CropBoxActive = false; } catch { }
+            map[key] = v.Id.Value.ToString(CultureInfo.InvariantCulture);
+            return v;
+        }
+
+        // the plane of the view: x along, y up
+        public static Transform Plane(View v)
+        {
+            var t = Transform.Identity;
+            t.Origin = v.Origin; t.BasisX = v.RightDirection; t.BasisY = v.UpDirection; t.BasisZ = v.ViewDirection;
+            return t;
+        }
+
+        // what the elements cover in the plane of the view
+        public static (double x0, double x1, double y0, double y1)? Extent(Document doc, View v, List<ElementId> ids, Transform T)
+        {
+            double x0 = double.MaxValue, x1 = double.MinValue, y0 = double.MaxValue, y1 = double.MinValue;
+            Transform inv = T.Inverse;
+            foreach (ElementId id in ids)
+            {
+                BoundingBoxXYZ bb = doc.GetElement(id)?.get_BoundingBox(v);
+                if (bb == null) continue;
+                foreach (XYZ q in new[] { bb.Min, bb.Max, new XYZ(bb.Min.X, bb.Max.Y, bb.Min.Z), new XYZ(bb.Max.X, bb.Min.Y, bb.Max.Z) })
+                {
+                    XYZ w = inv.OfPoint(bb.Transform.OfPoint(q));
+                    x0 = Math.Min(x0, w.X); x1 = Math.Max(x1, w.X); y0 = Math.Min(y0, w.Y); y1 = Math.Max(y1, w.Y);
+                }
+            }
+            return x0 > x1 ? ((double, double, double, double)?)null : (x0, x1, y0, y1);
+        }
+
+        private static BoundingBoxXYZ CropOf(View v, Transform T, double x0, double x1, double y0, double y1)
+        {
+            BoundingBoxXYZ cb = v.CropBox;
+            Transform inv = cb.Transform.Inverse;
+            XYZ a = inv.OfPoint(T.OfPoint(new XYZ(x0, y0, 0))), b = inv.OfPoint(T.OfPoint(new XYZ(x1, y1, 0)));
+            cb.Min = new XYZ(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), cb.Min.Z);
+            cb.Max = new XYZ(Math.Max(a.X, b.X), Math.Max(a.Y, b.Y), cb.Max.Z);
+            return cb;
+        }
+
+        public static void Crop(View v, Transform T, double x0, double x1, double y0, double y1, double margin)
+        {
+            v.CropBoxActive = true;
+            v.CropBox = CropOf(v, T, x0 - margin, x1 + margin, y0 - margin, y1 + margin);
+            try { v.CropBoxVisible = true; } catch { }
+        }
+
+        // a dependent view of the long view, cut with its crop box to one stage (part)
+        public static View Dependent(Document doc, View whole, Transform T, string name, double x0, double x1, double y0, double y1, double margin)
+        {
+            if (!whole.CanViewBeDuplicated(ViewDuplicateOption.AsDependent)) return null;
+            View dep = doc.GetElement(whole.Duplicate(ViewDuplicateOption.AsDependent)) as View;
+            if (dep == null) return null;
+            try { dep.Name = name; } catch { try { dep.Name = name + " (" + DateTime.Now.ToString("HHmmss", CultureInfo.InvariantCulture) + ")"; } catch { } }
+            dep.CropBoxActive = true;
+            dep.CropBox = CropOf(dep, T, x0 - margin, x1 + margin, y0 - margin, y1 + margin);
+            try { dep.CropBoxVisible = false; } catch { }
+            return dep;
+        }
+    }
+
+    // ================================================================ step 1: the sheet
+    internal sealed class TendonExcelForm : Form
+    {
+        public string Excel;
+        public List<int> Splits = new List<int>();
+
+        public TendonExcelForm(string excel, Func<string, int> spansOf)
+        {
+            Text = "AB Bridges - Tendon Excel";
+            Font = new System.Drawing.Font("Segoe UI", 9f);
+            FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(480, 400);
+            BackColor = WinColor.White;
+            Excel = excel;
+            int spans = 0;
+
+            Controls.Add(new Label { Text = "Excel", Location = new Point(14, 17), AutoSize = true });
+            var path = new TextBox { Location = new Point(110, 14), Width = 262, ReadOnly = true, Text = excel ?? "", BackColor = WinColor.White };
+            var browse = new Button { Text = "Browse...", Location = new Point(380, 12), Size = new Size(86, 26) };
+            Controls.Add(path); Controls.Add(browse);
+            var info = new Label { Location = new Point(14, 46), Size = new Size(452, 22), ForeColor = UiTheme.Navy };
+            Controls.Add(info);
+            Controls.Add(new Label { Text = "Number of paths", Location = new Point(14, 81), AutoSize = true });
+            var np = new NumericUpDown { Location = new Point(130, 78), Width = 60, Minimum = 1, Maximum = 6, Value = 2 };
+            Controls.Add(np);
+            var grid = new DataGridView
+            {
+                Location = new Point(14, 112), Size = new Size(452, 190), AllowUserToAddRows = false, AllowUserToDeleteRows = false, RowHeadersVisible = false,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, BackgroundColor = WinColor.White, SelectionMode = DataGridViewSelectionMode.CellSelect
+            };
+            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Path", HeaderText = "Path", ReadOnly = true, FillWeight = 25 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Splits", HeaderText = "Number of splits", FillWeight = 30 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Rows", HeaderText = "Rows between the anchors", ReadOnly = true, FillWeight = 45 });
+            Controls.Add(grid);
+            var note = new Label { Text = "Make sheet clears the sheet \"Tendon Profile\" and makes it again (Anchor1, empty rows, Anchor2 and the data of every path).",
+                                   Location = new Point(14, 310), Size = new Size(452, 36), ForeColor = WinColor.Gray };
+            Controls.Add(note);
+
+            int SplitsOf(int i) => int.TryParse(Convert.ToString(grid.Rows[i].Cells["Splits"].Value), out int k) && k >= 0 && k <= 9 ? k : 1;
+            void Rows()
+            {
+                for (int i = 0; i < grid.Rows.Count; i++)
+                    grid.Rows[i].Cells["Rows"].Value = spans > 0 ? $"{10 * spans + SplitsOf(i)}   (10 x {spans} spans + {SplitsOf(i)})" : "(choose the Excel)";
+            }
+            void Paths()
+            {
+                var keep = Enumerable.Range(0, grid.Rows.Count).Select(SplitsOf).ToList();
+                grid.Rows.Clear();
+                for (int i = 0; i < (int)np.Value; i++) grid.Rows.Add($"Path {i + 1}", (i < keep.Count ? keep[i] : 1).ToString(CultureInfo.InvariantCulture), "");
+                Rows();
+            }
+            void Pick(string p)
+            {
+                Excel = p; path.Text = p ?? "";
+                spans = 0;
+                try { spans = string.IsNullOrEmpty(p) || !File.Exists(p) ? 0 : spansOf(p); } catch { spans = 0; }
+                info.Text = spans > 0 ? $"{spans} span(s) in the Excel" : "Choose the bridge Excel (made by Civil 3D).";
+                info.ForeColor = spans > 0 ? UiTheme.Navy : WinColor.Firebrick;
+                Rows();
+            }
+            np.ValueChanged += (s, e) => Paths();
+            grid.CellEndEdit += (s, e) => Rows();
+            browse.Click += (s, e) =>
+            {
+                using (var d = new OpenFileDialog { Title = "Choose the bridge Excel", Filter = "Excel (*.xlsx)|*.xlsx" })
+                {
+                    if (!string.IsNullOrEmpty(Excel) && File.Exists(Excel)) { d.InitialDirectory = Path.GetDirectoryName(Excel); d.FileName = Path.GetFileName(Excel); }
+                    if (d.ShowDialog(this) == DialogResult.OK) Pick(d.FileName);
+                }
+            };
+            Paths();
+            Pick(excel);
+
+            var ok = new Button { Text = "Make sheet", Location = new Point(276, 356), Size = new Size(100, 32), BackColor = UiTheme.Navy, ForeColor = WinColor.White, FlatStyle = FlatStyle.Flat };
+            var cancel = new Button { Text = "Cancel", Location = new Point(382, 356), Size = new Size(84, 32), DialogResult = DialogResult.Cancel };
+            ok.Click += (s, e) =>
+            {
+                if (grid.IsCurrentCellInEditMode) grid.EndEdit();
+                if (spans < 1) { MessageBox.Show(this, "Choose the bridge Excel first (it has no axes).", "AB Bridges"); return; }
+                Splits = Enumerable.Range(0, grid.Rows.Count).Select(SplitsOf).ToList();
+                DialogResult = DialogResult.OK; Close();
+            };
+            Controls.Add(ok); Controls.Add(cancel);
+            CancelButton = cancel;
+            Brand.AddHeader(this, "Tendon Excel");
+        }
+    }
+
+    [Transaction(TransactionMode.Manual)]
+    public class TendonExcelCommand : UI.IExternalCommand
+    {
+        public UI.Result Execute(UI.ExternalCommandData data, ref string message, ElementSet elements)
+        {
+            Document doc = data.Application.ActiveUIDocument.Document;
+            try
+            {
+                Dictionary<string, string> map = AbStore.Load(doc);
+                string excel0 = map.TryGetValue("SUB|EXCEL", out string ex0) && File.Exists(ex0) ? ex0 : null;
+                using (var f = new TendonExcelForm(excel0, p => new TendonGeo(BridgeExcel.Load(p, false)).Spans))
+                {
+                    if (f.ShowDialog() != DialogResult.OK) return UI.Result.Cancelled;
+                    int spans = new TendonGeo(BridgeExcel.Load(f.Excel, false)).Spans;
+                    TendonSheet.Template(f.Excel, spans, f.Splits);
+                    using (var t = new Transaction(doc, "AB Bridges - Tendon Excel"))
+                    {
+                        t.Start();
+                        map["SUB|EXCEL"] = f.Excel;
+                        AbStore.Save(doc, map);
+                        t.Commit();
+                    }
+                    bool open = TendonSheet.IsLocked(f.Excel);
+                    if (!open) try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(f.Excel) { UseShellExecute = true }); } catch { }
+                    UI.TaskDialog.Show("AB Bridges", $"The sheet \"{TendonSheet.Name}\" was made ({f.Splits.Count} path(s)).\n\nType X and Y of every point between Anchor1 and Anchor2 and the data, save, then use Draw Tendon.");
+                }
+                return UI.Result.Succeeded;
+            }
+            catch (Exception ex)
+            {
+                UI.TaskDialog.Show("AB Bridges - error", ex.Message);
+                return UI.Result.Cancelled;
+            }
         }
     }
 
@@ -481,9 +1021,26 @@ namespace ABBridgesRevit
 
     internal static class TendonRun
     {
-        private const string ExcelKey = "SUB|EXCEL", IdsKey = "TEN|IDS|", SheetKey = "TEN|SHEET|", ViewKey = "TEN|VIEW|", TableKey = "TEN|TABLEFAM";
+        private const string ExcelKey = "SUB|EXCEL", IdsKey = "TEN|IDS|", SheetKey = "TEN|SHEET|", ViewKey = "TEN|VIEW|", TableKey = "TEN|TABLEFAM", SplitKey = "TEN|SPLIT|";
         private static readonly CultureInfo CI = CultureInfo.InvariantCulture;
         private static double Ft(double m) => UnitUtils.ConvertToInternalUnits(m, UnitTypeId.Meters);
+
+        // the Excel chosen in the window: only read (it is made by Tendon Excel and filled by hand)
+        private static TendonLoad Prepare(string excel)
+        {
+            var res = new TendonLoad();
+            if (string.IsNullOrEmpty(excel) || !File.Exists(excel)) { res.Message = "Choose the bridge Excel."; return res; }
+            BridgeExcel bx;
+            try { bx = BridgeExcel.Load(excel, false); }
+            catch (Exception ex) { res.Message = "The Excel could not be read: " + ex.Message; return res; }
+            var g = new TendonGeo(bx);
+            res.Geo = g;
+            if (g.Spans < 1) { res.Message = "The Excel has no axes (sheet Substructure / Super Structure)."; return res; }
+            TendonSet set = TendonSheet.Read(excel, g);
+            if (set == null) { res.Message = $"The Excel has no sheet \"{TendonSheet.Name}\". Make it with the button Tendon Excel first."; return res; }
+            res.Set = set;
+            return res;
+        }
 
         public static UI.Result Run(UI.ExternalCommandData data, bool update)
         {
@@ -492,52 +1049,27 @@ namespace ABBridgesRevit
             try
             {
                 Dictionary<string, string> map = AbStore.Load(doc);
-                string excel = map.TryGetValue(ExcelKey, out string ex0) && File.Exists(ex0) ? ex0 : null;
-                if (excel == null)
-                    using (var dlg = new OpenFileDialog { Title = "Choose the bridge Excel", Filter = "Excel (*.xlsx)|*.xlsx" })
-                    {
-                        if (dlg.ShowDialog() != DialogResult.OK) return UI.Result.Cancelled;
-                        excel = dlg.FileName;
-                    }
-                BridgeExcel bx = BridgeExcel.Load(excel, false);
-                var g = new TendonGeo(bx);
-                if (g.Spans < 1) { UI.TaskDialog.Show("AB Bridges", "The Excel has no axes (sheet Substructure / Super Structure)."); return UI.Result.Cancelled; }
+                string excel0 = map.TryGetValue(ExcelKey, out string ex0) && File.Exists(ex0) ? ex0 : null;
 
-                TendonSet set = TendonSheet.Read(excel, g);
-                if (set == null)
-                {
-                    TendonSheet.Write(excel, 2, g.Spans, null);
-                    UI.TaskDialog.Show("AB Bridges", $"The sheet \"{TendonSheet.Name}\" was added to the Excel (2 paths).\n\nFor every path type the whole tendon (X / Y from Anchor1 to Anchor2), the split(s) and the data, save the Excel, then run Create Tendon again.\n\n{excel}");
-                    return UI.Result.Succeeded;
-                }
-
+                // reads the Tendon Profile sheet of an Excel and puts it in order (paths = B2, split rows in X, old split
+                // rows out) - in the open workbook when Excel has it open. What is left to do is shown in the window.
+                Func<string, TendonLoad> prepare = Prepare;
+                var lastSplits = new Dictionary<int, string>();
+                foreach (var kv in map) if (kv.Key.StartsWith(SplitKey) && int.TryParse(kv.Key.Substring(SplitKey.Length), out int lp)) lastSplits[lp] = kv.Value;
                 List<string> tbs = new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_TitleBlocks).OfClass(typeof(FamilySymbol))
                     .Cast<FamilySymbol>().Select(s => s.FamilyName + " : " + s.Name).OrderBy(n => n).ToList();
                 List<string> details = new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_DetailComponents).OfClass(typeof(FamilySymbol))
                     .Cast<FamilySymbol>().Select(s => s.FamilyName + " : " + s.Name).OrderBy(n => n).ToList();
                 TendonForm form;
-                using (form = new TendonForm(set, g, tbs, update, details, map.TryGetValue(TableKey, out string lastT) ? lastT : null))
+                using (form = new TendonForm(excel0, prepare, tbs, update, details, map.TryGetValue(TableKey, out string lastT) ? lastT : null, lastSplits))
                     if (form.ShowDialog() != DialogResult.OK) return UI.Result.Cancelled;
                 map[TableKey] = form.TableFamily;
-
-                // more / fewer stages or paths: the sheet is written again (values kept) - the user fills the new blocks first
-                bool missing = set.Whole.Any(w => set.Splits.TryGetValue(w.Path, out string sp0) &&
-                    sp0.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries).Any(x => !w.Pts.Any(q => Math.Abs(g.StationOf(q.x) - g.StationOf(x.Trim())) < 1e-6)));
-                if (missing)
-                {
-                    TendonSheet.Write(excel, set.Whole.Count, g.Spans, set, g);
-                    UI.TaskDialog.Show("AB Bridges", "The split points were added as new rows in X (in their place along the path). Type their Y, save the Excel, then run it again.");
-                    return UI.Result.Succeeded;
-                }
-                var noY = set.Whole.Where(w => set.Splits.TryGetValue(w.Path, out string sp1) &&
-                    sp1.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries)
-                       .Any(x => w.Pts.Any(q => Math.Abs(g.StationOf(q.x) - g.StationOf(x.Trim())) < 1e-6 && double.IsNaN(q.y))))
-                    .Select(w => w.Path).ToList();
-                if (noY.Count > 0)
-                {
-                    UI.TaskDialog.Show("AB Bridges", "Type the Y of the split point in Path " + string.Join(", ", noY) + ", save the Excel, then run it again.");
-                    return UI.Result.Succeeded;
-                }
+                string excel = form.Excel;
+                TendonSet set = form.Loaded.Set;
+                TendonGeo g = form.Loaded.Geo;
+                TendonSheet.ApplySplits(set, g, form.Splits);
+                map[ExcelKey] = excel;
+                foreach (var kv in form.Splits) map[SplitKey + kv.Key] = kv.Value;
 
                 var log = new StringBuilder();
                 // 3D tendons: one family per stage, path and web (made outside the project transaction)
@@ -576,44 +1108,64 @@ namespace ABBridgesRevit
                     // bottom left. A stage longer than the sheet goes on more sheets of the same layout (part 1, 2 ...).
                     FamilySymbol tb = new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_TitleBlocks).OfClass(typeof(FamilySymbol))
                         .Cast<FamilySymbol>().FirstOrDefault(x => x.FamilyName + " : " + x.Name == form.TitleBlock);
-                    ViewFamilyType vft = new FilteredElementCollector(doc).OfClass(typeof(ViewFamilyType)).Cast<ViewFamilyType>().FirstOrDefault(x => x.ViewFamily == ViewFamily.Drafting);
-                    if (vft == null) log.AppendLine("No drafting view type in the project.");
+                    ViewFamilyType secT = new FilteredElementCollector(doc).OfClass(typeof(ViewFamilyType)).Cast<ViewFamilyType>().FirstOrDefault(x => x.ViewFamily == ViewFamily.Section);
+                    if (secT == null) log.AppendLine("No section view type in the project.");
                     FamilySymbol col = TendonDraw.TableFamily(doc, log, form.TableFamily, form.TableFile);
                     int nSheets = 0;
-                    for (int stage = 1; stage <= set.Stages && vft != null; stage++)
+
+                    // the views of the old version (one drafting view per stage) go
+                    foreach (string k0 in map.Keys.Where(k => k.StartsWith(ViewKey) && !k.StartsWith(ViewKey + "P")).ToList())
                     {
-                        // views of every path of this stage, per part
-                        var views = new Dictionary<(int path, int part), View>();
-                        int nParts = 1;
-                        List<TendonProfile> paths = set.Profiles.Where(x => x.Stage == stage).OrderBy(x => x.Path).ToList();
-                        foreach (TendonProfile p in paths)
+                        if (long.TryParse(map[k0], out long lo) && doc.GetElement(new ElementId(lo)) is ViewDrafting) { try { doc.Delete(new ElementId(lo)); } catch { } }
+                        map.Remove(k0);
+                    }
+                    foreach (string k0 in map.Keys.Where(k => k.StartsWith(IdsKey + "2D|") && !k.StartsWith(IdsKey + "2D|P")).ToList()) map.Remove(k0);
+
+                    // one long section view per path: its stages (and the parts of a long stage) drawn side by side,
+                    // every one shown by a dependent view cut with its crop box -> the views on the sheets
+                    var views = new Dictionary<(int stage, int path, int part), View>();
+                    var partsOf = new Dictionary<int, int>();
+                    for (int pth = 1; pth <= set.Paths && secT != null; pth++)
+                    {
+                        var stages = set.Profiles.Where(x => x.Path == pth).OrderBy(x => x.Stage).ToList();
+                        if (stages.Count == 0) continue;
+                        ViewSection whole = TendonViews.PathView(doc, secT, pth, map, ViewKey + "P" + pth, IdsKey + "2D|P" + pth);
+                        Transform T = TendonViews.Plane(whole);
+                        double cursor = 0;
+                        var cuts = new List<(int stage, int part, int parts, double x0, double x1, double y0, double y1)>();
+                        var drawn = new List<ElementId>();
+                        foreach (TendonProfile sp in stages)
                         {
-                            string pk = p.Stage + "|" + p.Path;
-                            var parts = TendonDraw.Parts(g, set, p, 150);
-                            nParts = Math.Max(nParts, parts.Count);
-                            for (int k = parts.Count + 1; k <= 6; k++)
-                                if (map.TryGetValue(ViewKey + pk + "|" + k, out string ov) && long.TryParse(ov, out long lo))
-                                { try { doc.Delete(new ElementId(lo)); } catch { } map.Remove(ViewKey + pk + "|" + k); map.Remove(IdsKey + "2D|" + pk + "|" + k); }
+                            var parts = TendonDraw.Parts(g, set, sp, 150);
+                            partsOf[sp.Stage] = Math.Max(partsOf.TryGetValue(sp.Stage, out int pc) ? pc : 1, parts.Count);
                             for (int k = 1; k <= parts.Count; k++)
                             {
-                                string vk = ViewKey + pk + "|" + k;
-                                View v = map.TryGetValue(vk, out string vid) && long.TryParse(vid, out long l2) ? doc.GetElement(new ElementId(l2)) as View : null;
-                                if (v == null)
-                                {
-                                    v = ViewDrafting.Create(doc, vft.Id);
-                                    try { v.Name = $"AB Tendon - Path {p.Path} - Stage {p.Stage}" + (parts.Count > 1 ? $" - Part {k}" : ""); } catch { }
-                                    v.Scale = 150;
-                                    map[vk] = v.Id.Value.ToString(CI);
-                                }
-                                string dk = IdsKey + "2D|" + pk + "|" + k;
-                                if (map.TryGetValue(dk, out string old))
-                                    foreach (string sid in old.Split(',')) if (long.TryParse(sid, out long l3)) { try { doc.Delete(new ElementId(l3)); } catch { } }
-                                List<ElementId> ids = TendonDraw.Draw(doc, v, g, set, p, form.VScale, parts[k - 1].a, parts[k - 1].b, k, parts.Count, col);
-                                map[dk] = string.Join(",", ids.Select(i => i.Value.ToString(CI)));
-                                views[(p.Path, k)] = v;
+                                List<ElementId> ids = TendonDraw.Draw(doc, whole, g, set, sp, form.VScale, parts[k - 1].a, parts[k - 1].b, k, parts.Count, col, T);
+                                doc.Regenerate();
+                                var ex = TendonViews.Extent(doc, whole, ids, T);
+                                if (ex == null) continue;
+                                double dx = cursor - ex.Value.x0;
+                                if (Math.Abs(dx) > 1e-6) { ElementTransformUtils.MoveElements(doc, ids, T.BasisX * dx); doc.Regenerate(); }
+                                cuts.Add((sp.Stage, k, parts.Count, ex.Value.x0 + dx, ex.Value.x1 + dx, ex.Value.y0, ex.Value.y1));
+                                cursor = ex.Value.x1 + dx + Ft(10);       // a gap of 10 m between the stages in the long view
+                                drawn.AddRange(ids);
                             }
                         }
+                        map[IdsKey + "2D|P" + pth] = string.Join(",", drawn.Select(i => i.Value.ToString(CI)));
+                        if (cuts.Count == 0) continue;
+                        TendonViews.Crop(whole, T, cuts.Min(c => c.x0), cuts.Max(c => c.x1), cuts.Min(c => c.y0), cuts.Max(c => c.y1), Ft(3));
+                        foreach (var c in cuts)
+                        {
+                            string nm = $"AB Tendon - Path {pth} - Stage {c.stage}" + (c.parts > 1 ? $" - Part {c.part}" : "");
+                            View dep = TendonViews.Dependent(doc, whole, T, nm, c.x0, c.x1, c.y0, c.y1, Ft(1.5));
+                            if (dep != null) views[(c.stage, pth, c.part)] = dep;
+                        }
+                    }
 
+                    for (int stage = 1; stage <= set.Stages && secT != null; stage++)
+                    {
+                        List<TendonProfile> paths = set.Profiles.Where(x => x.Stage == stage).OrderBy(x => x.Path).ToList();
+                        int nParts = partsOf.TryGetValue(stage, out int np0) ? np0 : 1;
                         for (int part = 1; part <= nParts; part++)
                         {
                             // the sheet: made once, kept on Update; missing views are placed, the data tables / notes redrawn
@@ -638,7 +1190,7 @@ namespace ABBridgesRevit
                             double tableW = Ft(0.095);                                   // data table at the right of every view
                             double right = o.Min.U + W * 0.97 - tableW;                  // views end here
                             double zoneTop = o.Max.V - H * 0.05, zoneBot = o.Min.V + H * 0.25;   // notes / title block below
-                            var onSheet = paths.Where(q => views.ContainsKey((q.Path, part))).ToList();
+                            var onSheet = paths.Where(q => views.ContainsKey((stage, q.Path, part))).ToList();
                             var placed = new HashSet<ElementId>(sheet.GetAllPlacedViews());
                             string sdk = IdsKey + "SHEET|S" + stage + "|" + part;
                             if (map.TryGetValue(sdk, out string olds))
@@ -647,7 +1199,7 @@ namespace ABBridgesRevit
                             for (int k = 0; k < onSheet.Count; k++)
                             {
                                 TendonProfile p = onSheet[k];
-                                View v = views[(p.Path, part)];
+                                View v = views[(stage, p.Path, part)];
                                 double cv = zoneTop - (zoneTop - zoneBot) * (k + 0.5) / onSheet.Count;
                                 double cu = (o.Min.U + W * 0.03 + right) / 2;
                                 Viewport vp = new FilteredElementCollector(doc, sheet.Id).OfClass(typeof(Viewport)).Cast<Viewport>().FirstOrDefault(x => x.ViewId == v.Id);
@@ -730,7 +1282,8 @@ namespace ABBridgesRevit
                 using (var t = new Transaction(fdoc, "tendon"))
                 {
                     t.Start();
-                    var local = pts.Select(q => q - origin).ToList();
+                    XYZ o0 = origin;
+                    var local = pts.Select(q => q - o0).ToList();
                     Curve path = local.Count == 2 ? (Curve)Line.CreateBound(local[0], local[1]) : HermiteSpline.Create(local, false);
                     var loop = new CurveLoop(); loop.Append(path);
                     XYZ tan = path.ComputeDerivatives(path.GetEndParameter(0), false).BasisX.Normalize();
@@ -776,9 +1329,12 @@ namespace ABBridgesRevit
             return res;
         }
 
-        public static List<ElementId> Draw(Document doc, View v, TendonGeo g, TendonSet set, TendonProfile p, double vs, int ia, int ib, int part, int parts, FamilySymbol col = null)
+        public static List<ElementId> Draw(Document doc, View v, TendonGeo g, TendonSet set, TendonProfile p, double vs, int ia, int ib, int part, int parts, FamilySymbol col = null, Transform T = null)
         {
             var ids = new List<ElementId>();
+            // drawn in the plane of the view: a drafting view (identity) or the long section of the path (T)
+            T = T ?? Transform.Identity;
+            XYZ M(XYZ q) => T.OfPoint(q);
             var all = g.Stations(set, p);
             if (all.Count < 2) return ids;
             double total = all.Last().sta - all.First().sta;
@@ -801,15 +1357,15 @@ namespace ABBridgesRevit
             }
             catch { }
 
-            void Ln(XYZ a, XYZ b, GraphicsStyle gs) { if (a.DistanceTo(b) < 1e-4) return; try { DetailCurve dc = doc.Create.NewDetailCurve(v, Line.CreateBound(a, b)); if (gs != null) dc.LineStyle = gs; ids.Add(dc.Id); } catch { } }
+            void Ln(XYZ a, XYZ b, GraphicsStyle gs) { if (a.DistanceTo(b) < 1e-4) return; try { DetailCurve dc = doc.Create.NewDetailCurve(v, Line.CreateBound(M(a), M(b))); if (gs != null) dc.LineStyle = gs; ids.Add(dc.Id); } catch { } }
             void Tx(XYZ at, string t, double rot = 0, HorizontalTextAlignment ha = HorizontalTextAlignment.Center)
             {
-                try { ids.Add(TextNote.Create(doc, v.Id, at, t, new TextNoteOptions(tt) { Rotation = rot, HorizontalAlignment = ha }).Id); } catch { }
+                try { ids.Add(TextNote.Create(doc, v.Id, M(at), t, new TextNoteOptions(tt) { Rotation = rot, HorizontalAlignment = ha }).Id); } catch { }
             }
             void TxT(XYZ at, string t, double rot, ElementId type)
             {
                 if (string.IsNullOrEmpty(t)) return;
-                try { ids.Add(TextNote.Create(doc, v.Id, at, t, new TextNoteOptions(type) { Rotation = rot, HorizontalAlignment = HorizontalTextAlignment.Center }).Id); } catch { }
+                try { ids.Add(TextNote.Create(doc, v.Id, M(at), t, new TextNoteOptions(type) { Rotation = rot, HorizontalAlignment = HorizontalTextAlignment.Center }).Id); } catch { }
             }
 
             // box: grey fill, outline, the section lines, the cells (dashed) between the diaphragms
@@ -820,7 +1376,7 @@ namespace ABBridgesRevit
             {
                 FilledRegionType frt = new FilteredElementCollector(doc).OfClass(typeof(FilledRegionType)).Cast<FilledRegionType>()
                     .OrderByDescending(x => x.Name.IndexOf("Solid", StringComparison.OrdinalIgnoreCase) >= 0 || x.Name.IndexOf("Gray", StringComparison.OrdinalIgnoreCase) >= 0).FirstOrDefault();
-                if (frt != null) ids.Add(FilledRegion.Create(doc, frt.Id, v.Id, new List<CurveLoop> { box }).Id);
+                if (frt != null) ids.Add(FilledRegion.Create(doc, frt.Id, v.Id, new List<CurveLoop> { CurveLoop.CreateViaTransform(box, T) }).Id);
             }
             catch { }
             foreach (Curve c in box) Ln(c.GetEndPoint(0), c.GetEndPoint(1), thin);
@@ -858,7 +1414,7 @@ namespace ABBridgesRevit
                 if (a < s0 - 1e-6 || a > s1 + 1e-6) continue;
                 XYZ c = new XYZ(Ft(a - s0), -yb, 0);
                 double rr = Ft(3.2 * paper);
-                try { ids.Add(doc.Create.NewDetailCurve(v, Arc.Create(c, rr, 0, Math.PI, XYZ.BasisX, XYZ.BasisY)).Id); ids.Add(doc.Create.NewDetailCurve(v, Arc.Create(c, rr, Math.PI, 2 * Math.PI, XYZ.BasisX, XYZ.BasisY)).Id); } catch { }
+                try { ids.Add(doc.Create.NewDetailCurve(v, Arc.Create(M(c), rr, 0, Math.PI, T.OfVector(XYZ.BasisX), T.OfVector(XYZ.BasisY))).Id); ids.Add(doc.Create.NewDetailCurve(v, Arc.Create(M(c), rr, Math.PI, 2 * Math.PI, T.OfVector(XYZ.BasisX), T.OfVector(XYZ.BasisY))).Id); } catch { }
                 Tx(c + new XYZ(0, Ft(1.2 * paper), 0), g.AxisName[i]);
                 Ln(new XYZ(c.X, c.Y - rr, 0), P(a, depth) + new XYZ(0, -Ft(2 * paper), 0), dash);
             }
@@ -883,7 +1439,8 @@ namespace ABBridgesRevit
             var cp = st.Select(q => P(q.sta, double.IsNaN(q.y) ? depth / 2 : q.y)).ToList();
             try
             {
-                Curve tc = cp.Count == 2 ? (Curve)Line.CreateBound(cp[0], cp[1]) : HermiteSpline.Create(cp, false);
+                var cpm = cp.Select(M).ToList();
+                Curve tc = cpm.Count == 2 ? (Curve)Line.CreateBound(cpm[0], cpm[1]) : HermiteSpline.Create(cpm, false);
                 DetailCurve dc = doc.Create.NewDetailCurve(v, tc); if (cable != null) dc.LineStyle = cable; ids.Add(dc.Id);
             }
             catch { }
@@ -933,7 +1490,7 @@ namespace ABBridgesRevit
                     SetLen(col, "Row 1 H", rh1); SetLen(col, "Row 2 H", rh2);
                     for (int k = 0; k < n; k++)
                     {
-                        FamilyInstance fi = doc.Create.NewFamilyInstance(new XYZ(x0 + k * cw, y0, 0), col, v);
+                        FamilyInstance fi = doc.Create.NewFamilyInstance(M(new XYZ(x0 + k * cw, y0, 0)), col, v);
                         SetText(fi, "X Label", labs[k]); SetText(fi, "Y Value", vals[k]); SetLen(fi, "Width", cw);
                         SetLen(fi, "Row 1 H", rh1); SetLen(fi, "Row 2 H", rh2);          // when they are instance parameters
                         ids.Add(fi.Id);

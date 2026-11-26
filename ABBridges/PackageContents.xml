@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationPackage SchemaVersion="1.0"
+                    AutodeskProduct="AutoCAD"
+                    ProductType="Application"
+                    Name="AB Bridges"
+                    Description="AB Bridges: bridge stations, levels, construction joints, under-bridge clearance, Excel for Revit; PL. Start."
+                    AppVersion="2.0.0"
+                    Author="Abdeen"
+                    ProductCode="{5C1E7A44-2D9B-4F3A-8E61-7B2A9C0D4E21}"
+                    UpgradeCode="{9A4D2E17-6B3C-4C8F-B5A0-1E2F3D4C5B6A}">
+  <CompanyDetails Name="Abdeen" />
+  <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R25.0" SeriesMax="R25.0" />
+  <Components Description="AB Bridges">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R25.0" SeriesMax="R25.0" />
+    <ComponentEntry AppName="ABBridges"
+                    ModuleName="./Contents/ABBridges.dll"
+                    AppDescription="AB Bridges ribbon tab: Extract Data and PL. Start"
+                    LoadOnAutoCADStartup="True">
+      <Commands GroupName="ABBRIDGES">
+        <Command Global="ABBRIDGES" Local="ABBRIDGES" />
+        <Command Global="BRIDGEPTS" Local="BRIDGEPTS" />
+        <Command Global="PLSTART" Local="PLSTART" />
+        <Command Global="ABBASEPOINT" Local="ABBASEPOINT" />
+      </Commands>
+    </ComponentEntry>
+  </Components>
+</ApplicationPackage>

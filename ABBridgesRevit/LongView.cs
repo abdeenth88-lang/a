@@ -14,6 +14,22 @@ namespace ABBridgesRevit
         public List<(string name, double x, string type)> Axes = new List<(string, double, string)>();
         public List<(double x, double z)> Ground = new List<(double, double)>();
         public List<(string road, List<(double x, double z)> pts)> Roads = new List<(string, List<(double, double)>)>();
+
+        // the quick part straight from the Excel (axes, ground, roads) - shown at once, the Revit cut is added after
+        public static LongData FromExcel(BridgeExcel bx)
+        {
+            var d = new LongData();
+            if (bx == null) return d;
+            foreach (AxisData a in bx.Axes.OrderBy(a => a.Station))
+            {
+                d.Axes.Add((a.Name, a.Station, a.Name.StartsWith("A", StringComparison.OrdinalIgnoreCase) ? "Abutment" : "Pier"));
+                double g = AxisData.ZAt(a.Ngl, 0);
+                if (!double.IsNaN(g)) d.Ground.Add((a.Station, g));
+            }
+            foreach (var grp in bx.Roads.GroupBy(r => r.road))
+                d.Roads.Add((grp.Key, grp.Select(r => (r.sta, r.z)).ToList()));
+            return d;
+        }
     }
 
     internal static class UiTheme
@@ -58,10 +74,13 @@ namespace ABBridgesRevit
             };
         }
 
+        // screenshots for checking the UI: only when the folder "AB Bridges screens" exists on the desktop
+        // (it was writing a picture at every page / axis change and slowed the dialogs down)
         public static void Snap(Control c, string name)
         {
             try
             {
+                if (!System.IO.Directory.Exists(System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "AB Bridges screens"))) return;
                 string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "AB Bridges screens");
                 System.IO.Directory.CreateDirectory(dir);
                 using (var bmp = new Bitmap(Math.Max(1, c.Width), Math.Max(1, c.Height)))

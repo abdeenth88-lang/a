@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <AssemblyName>AB Bridges Setup - 2025</AssemblyName>
+    <RootNamespace>ABBridgesSetup</RootNamespace>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>AB.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Company>Abdeen</Company>
+    <Product>AB Bridges</Product>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="payload\**\*" LogicalName="payload/%(RecursiveDir)%(Filename)%(Extension)" />
+    <EmbeddedResource Include="AB_logo_256.png" LogicalName="AB_logo_256.png" />
+    <EmbeddedResource Include="AB.ico" LogicalName="AB.ico" />
+  </ItemGroup>
+</Project>

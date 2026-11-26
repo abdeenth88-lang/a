@@ -11,6 +11,8 @@ using Autodesk.Revit.UI;
 using Form = System.Windows.Forms.Form;
 using Color = System.Drawing.Color;
 using Point = System.Drawing.Point;
+using Panel = System.Windows.Forms.Panel;
+using Control = System.Windows.Forms.Control;
 
 namespace ABBridgesRevit
 {

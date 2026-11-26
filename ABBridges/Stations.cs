@@ -74,6 +74,8 @@ namespace ABBridges
     {
         public List<Section> Sections = new List<Section>();
         public List<SpanInfo> Spans = new List<SpanInfo>();
+        // the parts that are divided equally (between two fixed stations): key, from, to, number of parts, the automatic number
+        public List<(string key, double a, double b, int n, int auto)> Parts = new List<(string, double, double, int, int)>();
     }
 
     internal static class Stations
@@ -209,12 +211,15 @@ namespace ABBridges
 
             // internal diaphragms: equally spaced between the axes (CL), two sections Gap apart each
             IdSpan ids = BridgeSettings.IdOf(s.Key);
-            if (ids.Count > 0)
+            if (ids.Enabled && ids.Count > 0)
             {
                 double A0 = s.A.Station, B0 = s.B.Station, half = Math.Max(0, ids.Gap) / 2.0;
+                // equal parts of the span length along the Centerline (typed length if given), measured from axis A
+                double L = ids.Length;
+                if (double.IsNaN(L) || L <= 0) L = B0 - A0;
                 for (int k = 1; k <= ids.Count; k++)
                 {
-                    double c = A0 + (B0 - A0) * k / (ids.Count + 1);
+                    double c = A0 + L * k / (ids.Count + 1);
                     string nm = s.Name + " ID" + k.ToString(CI);
                     if (c - half <= a + 0.01 || c + half >= b - 0.01) { warn.Add($"{nm} is outside the span between the diaphragm faces - skipped."); continue; }
                     // a near-diaphragm station or CJ right on it gives way
@@ -248,7 +253,11 @@ namespace ABBridges
                 if (noDiv) continue;
                 double L = g.Sta - f.Sta;
                 if (L <= 1e-6) continue;
-                int n = Math.Max(1, (int)Math.Ceiling(L / sp - 1e-9));
+                // equal parts of at most Max spacing; the user can add / take away parts here (click / Shift + click on the plan)
+                int auto = Math.Max(1, (int)Math.Ceiling(L / sp - 1e-9));
+                string pk = PartKey(s.Key, f.Sta);
+                int n = Math.Max(1, auto + (BridgeSettings.DivExtra.TryGetValue(pk, out int extra) ? extra : 0));
+                set.Parts.Add((pk, f.Sta, g.Sta, n, auto));
                 for (int k = 1; k < n; k++)
                 {
                     double st = f.Sta + L * k / n;
@@ -264,6 +273,8 @@ namespace ABBridges
                 }
             }
         }
+
+        public static string PartKey(string spanKey, double from) => spanKey + "|" + from.ToString("0.000", CI);
 
         // line parallel to the axis, shifted perpendicular to the axis by 'offset' (negative = down-station)
         private static Section FaceSection(CenterLine cl, AxisInfo ax, double offset, string remark, SectionKind kind)

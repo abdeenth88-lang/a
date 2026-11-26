@@ -26,8 +26,14 @@ namespace ABBridges
     // internal diaphragms of one span: Count pairs of sections, Gap apart, equally spaced between the axes (CL)
     internal sealed class IdSpan
     {
+        public bool Enabled = true;           // ticked: this span has internal diaphragms
         public int Count = 2;
         public double Gap = 0.30;
+        // the span length is ONE value per span, shared with the CJ page and the Setup plan (typed on any page = everywhere)
+        internal CjSpan Len = new CjSpan();
+        public double AutoLength { get => Len.AutoLength; set => Len.AutoLength = value; }
+        public double? UserLength { get => Len.UserLength; set => Len.UserLength = value; }
+        public double Length => Len.Length;
     }
 
     internal static class BridgeSettings
@@ -36,9 +42,12 @@ namespace ABBridges
         public static List<double> NearDist = new List<double> { 2.70, 5.40 };
         public static Dictionary<string, IdSpan> Internal = new Dictionary<string, IdSpan>();
         public static bool InternalAll = true;
+        // parts added (+) / taken away (-) by the user in an equally divided part (key = span key | from station)
+        public static Dictionary<string, int> DivExtra = new Dictionary<string, int>();
         public static IdSpan IdOf(string key)
         {
             if (!Internal.TryGetValue(key, out IdSpan v)) { v = new IdSpan(); Internal[key] = v; }
+            v.Len = CjOf(key);                    // the same length object as the CJ page
             return v;
         }
 
@@ -86,6 +95,7 @@ namespace ABBridges
             Axis.Clear();
             Cj.Clear();
             Internal.Clear();
+            DivExtra.Clear();
             RoadDepth.Clear();
             LastRun.Clear();
             OutputFolder = "";

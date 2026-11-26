@@ -184,7 +184,8 @@ namespace ABBridges
                 ThickLeft = thickLeft,
                 NumFmt = (v is double || v is XFormula) ? fmt : null,
                 HAlign = num ? "right" : (center ? "center" : null),
-                BorderColor = border ?? (bold ? Line : Soft)
+                BorderColor = border != null && !thickLeft ? border : (bold ? Line : Soft),
+                LeftColor = thickLeft ? border : null
             };
             sh.Set(r, c, v, st);
         }

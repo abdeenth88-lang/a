@@ -48,15 +48,15 @@ namespace ABBridgesRevit
                     ToolTip = "Reads every imported table again from its Excel file and range, and redraws it in place.",
                     LargeImage = Icon("icon_PD.png", 32), Image = Icon("icon_PD.png", 16)
                 });
-                tendon.AddItem(new PushButtonData("AB_CreateTendon", "Create\nTendon", asm, typeof(CreateTendonCommand).FullName)
+                tendon.AddItem(new PushButtonData("AB_TendonExcel", "Tendon\nExcel", asm, typeof(TendonExcelCommand).FullName)
                 {
-                    ToolTip = "Reads the sheet Tendon Profile of the bridge Excel (makes it if missing), builds the 3D tendons in the webs, the profile views (×3 vertical) and the sheets.",
-                    LargeImage = Icon("icon_CD.png", 32), Image = Icon("icon_CD.png", 16)
+                    ToolTip = "Step 1: choose the bridge Excel, the number of paths and of splits per path. Makes the sheet Tendon Profile again (Anchor1, empty rows, Anchor2 and the data); you type every X and Y.",
+                    LargeImage = Icon("icon_RF.png", 32), Image = Icon("icon_RF.png", 16)
                 });
-                tendon.AddItem(new PushButtonData("AB_UpdateTendon", "Update\nTendon", asm, typeof(UpdateTendonCommand).FullName)
+                tendon.AddItem(new PushButtonData("AB_CreateTendon", "Draw\nTendon", asm, typeof(CreateTendonCommand).FullName)
                 {
-                    ToolTip = "Reads the Tendon Profile sheet again and updates the tendons, the views and the tables (the sheets stay).",
-                    LargeImage = Icon("icon_PD.png", 32), Image = Icon("icon_PD.png", 16)
+                    ToolTip = "Step 2: reads the sheet Tendon Profile, you choose the split(s) of every path, then it draws one long view per path cut by crop boxes into its stages, the 3D tendons and the sheets (one per stage). Run again to redraw: the sheets stay.",
+                    LargeImage = Icon("icon_CD.png", 32), Image = Icon("icon_CD.png", 16)
                 });
 
                 create.AddItem(new PushButtonData("AB_CreateDeck", "Create\nDeck", asm, typeof(CreateDeckCommand).FullName)
